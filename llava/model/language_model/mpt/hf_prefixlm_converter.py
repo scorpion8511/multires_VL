@@ -20,13 +20,29 @@ from transformers.models.bloom.modeling_bloom import (
 )
 try:
     from transformers.models.bloom.modeling_bloom import _expand_mask as _expand_mask_bloom
-except ImportError:  # pragma: no cover - fallback for newer Transformers
+except Exception:  # pragma: no cover - bloom helper moved or removed
     try:
-        from transformers.modeling_utils import expand_mask as _expand_mask_bloom
-    except Exception:  # pragma: no cover - fallback for latest Transformers
-        from transformers.modeling_attn_mask_utils import (
-            expand_mask as _expand_mask_bloom,
-        )
+        from transformers.modeling_utils import expand_mask as _hf_expand_mask_bloom
+
+        def _expand_mask_bloom(mask, *, tgt_length=None, dtype=None):
+            dtype = dtype if dtype is not None else mask.dtype
+            return _hf_expand_mask_bloom(mask, dtype, tgt_length)
+    except Exception:  # pragma: no cover - latest transformers
+        try:
+            from transformers.modeling_attn_mask_utils import expand_mask as _hf_expand_mask_bloom
+
+            def _expand_mask_bloom(mask, *, tgt_length=None, dtype=None):
+                dtype = dtype if dtype is not None else mask.dtype
+                return _hf_expand_mask_bloom(mask, dtype, tgt_length)
+        except Exception:  # pragma: no cover - no helper available
+            def _expand_mask_bloom(mask, *, tgt_length=None, dtype=None):
+                dtype = dtype if dtype is not None else mask.dtype
+                src_len = mask.size(-1)
+                tgt_length = src_len if tgt_length is None else tgt_length
+                expanded = mask[:, None, None, :].to(dtype)
+                expanded = expanded.expand(mask.size(0), 1, tgt_length, src_len)
+                inverted = 1.0 - expanded
+                return inverted.masked_fill(inverted.to(torch.bool), torch.finfo(dtype).min)
 from transformers.models.bloom.modeling_bloom import _make_causal_mask as _make_causal_mask_bloom
 from transformers.models.bloom.modeling_bloom import logging
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
@@ -36,13 +52,29 @@ from transformers.models.gptj.modeling_gptj import GPTJForCausalLM
 from transformers.models.opt.modeling_opt import OPTForCausalLM
 try:
     from transformers.models.opt.modeling_opt import _expand_mask as _expand_mask_opt
-except ImportError:  # pragma: no cover - fallback for newer Transformers
+except Exception:  # pragma: no cover - opt helper moved or removed
     try:
-        from transformers.modeling_utils import expand_mask as _expand_mask_opt
-    except Exception:  # pragma: no cover - fallback for latest Transformers
-        from transformers.modeling_attn_mask_utils import (
-            expand_mask as _expand_mask_opt,
-        )
+        from transformers.modeling_utils import expand_mask as _hf_expand_mask_opt
+
+        def _expand_mask_opt(mask, *, tgt_length=None, dtype=None):
+            dtype = dtype if dtype is not None else mask.dtype
+            return _hf_expand_mask_opt(mask, dtype, tgt_length)
+    except Exception:  # pragma: no cover - latest transformers
+        try:
+            from transformers.modeling_attn_mask_utils import expand_mask as _hf_expand_mask_opt
+
+            def _expand_mask_opt(mask, *, tgt_length=None, dtype=None):
+                dtype = dtype if dtype is not None else mask.dtype
+                return _hf_expand_mask_opt(mask, dtype, tgt_length)
+        except Exception:  # pragma: no cover - no helper available
+            def _expand_mask_opt(mask, *, tgt_length=None, dtype=None):
+                dtype = dtype if dtype is not None else mask.dtype
+                src_len = mask.size(-1)
+                tgt_length = src_len if tgt_length is None else tgt_length
+                expanded = mask[:, None, None, :].to(dtype)
+                expanded = expanded.expand(mask.size(0), 1, tgt_length, src_len)
+                inverted = 1.0 - expanded
+                return inverted.masked_fill(inverted.to(torch.bool), torch.finfo(dtype).min)
 from transformers.models.opt.modeling_opt import _make_causal_mask as _make_causal_mask_opt
 logger = logging.get_logger(__name__)
 _SUPPORTED_GPT_MODELS = (GPT2LMHeadModel, GPTJForCausalLM, GPTNeoForCausalLM, GPTNeoXForCausalLM)
