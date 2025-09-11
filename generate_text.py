@@ -22,9 +22,6 @@ import math
 
 questions = ["Can you describe the main features visible in this histopathology image?"]
 
-ckpt = "wisdomik/Quilt-Llava-v1.5-7b"
-temp, conv_mode = 0, "vicuna_v1"
-
 def split_list(lst, n):
     """Split a list into n (roughly) equal-sized chunks"""
     chunk_size = math.ceil(len(lst) / n)  # integer division
@@ -37,9 +34,13 @@ def get_chunk(lst, n, k):
 
 
 def eval_model(args):
-    args.model_path = ckpt
-    args.temperature = temp
-    args.conv_mode = conv_mode
+    # configure defaults for model path, temperature, and conversation mode
+    if getattr(args, "model_path", None) is None:
+        args.model_path = "wisdomik/Quilt-Llava-v1.5-7b"
+    if getattr(args, "temperature", None) is None:
+        args.temperature = 0
+    if getattr(args, "conv_mode", None) is None:
+        args.conv_mode = "vicuna_v1"
 
     for a in args.answers_dir:
         os.makedirs(a, exist_ok=True)
@@ -112,7 +113,10 @@ def eval_model(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("image_folder", nargs="?", default="test_images_sup", help="folder containing images to describe")
+    parser.add_argument("--model-path", type=str, help="pretrained model checkpoint to use")
     parser.add_argument("--model-base", type=str, default=None)
+    parser.add_argument("--temperature", type=float, default=0)
+    parser.add_argument("--conv-mode", type=str, default="vicuna_v1")
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--num-beams", type=int, default=1)
     args = parser.parse_args()
