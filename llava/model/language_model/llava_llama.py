@@ -131,7 +131,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
-                "images": kwargs.get("images", None),
+                # Only pass images during the first generation step to avoid
+                # re-encoding them on subsequent calls when past_key_values is
+                # already populated.
+                "images": None if past_key_values is not None else kwargs.get("images", None),
             }
         )
         return model_inputs
