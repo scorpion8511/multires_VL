@@ -40,7 +40,11 @@ def eval_model(args):
     if getattr(args, "temperature", None) is None:
         args.temperature = 0
     if getattr(args, "conv_mode", None) is None:
-        args.conv_mode = "vicuna_v1"
+        # LLaVA models such as Quilt-Llava expect the "llava_v1" conversation
+        # template. Using an incompatible template can lead to degenerate
+        # generations that ignore the visual input. Default to "llava_v1" so
+        # the model processes images properly unless the caller overrides it.
+        args.conv_mode = "llava_v1"
 
     for a in args.answers_dir:
         os.makedirs(a, exist_ok=True)
@@ -116,7 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str, help="pretrained model checkpoint to use")
     parser.add_argument("--model-base", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=0)
-    parser.add_argument("--conv-mode", type=str, default="vicuna_v1")
+    parser.add_argument("--conv-mode", type=str, default="llava_v1")
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--num-beams", type=int, default=1)
     args = parser.parse_args()
