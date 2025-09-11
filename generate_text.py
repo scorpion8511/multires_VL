@@ -22,14 +22,8 @@ import math
 
 questions = ["Can you describe the main features visible in this histopathology image?"]
 
-image_folder = "test_images_sup"
-answers_dir = [f"{image_folder}_answers/main"]
-
 ckpt = "wisdomik/Quilt-Llava-v1.5-7b"
 temp, conv_mode = 0, "vicuna_v1"
-
-for a in answers_dir:
-    if not os.path.exists(a): os.makedirs(a) 
 
 def split_list(lst, n):
     """Split a list into n (roughly) equal-sized chunks"""
@@ -46,15 +40,18 @@ def eval_model(args):
     args.model_path = ckpt
     args.temperature = temp
     args.conv_mode = conv_mode
-    
+
+    for a in args.answers_dir:
+        os.makedirs(a, exist_ok=True)
+
     # Model
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
 
-    
-    for qs, ans_dir in zip(questions, answers_dir):
+
+    for qs, ans_dir in zip(questions, args.answers_dir):
         cur_prompt = qs
         if model.config.mm_use_im_start_end:
             qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
@@ -68,7 +65,7 @@ def eval_model(args):
 
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
 
-        for image_path in [f"{image_folder}/{a}" for a in os.listdir(image_folder)]:
+        for image_path in [f"{args.image_folder}/{a}" for a in os.listdir(args.image_folder)]:
             image = Image.open(image_path)
             image_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
 
@@ -110,3 +107,14 @@ def eval_model(args):
             ans_file.close()
     
     print('Done')
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("image_folder", nargs="?", default="test_images_sup", help="folder containing images to describe")
+    parser.add_argument("--model-base", type=str, default=None)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--num-beams", type=int, default=1)
+    args = parser.parse_args()
+    args.answers_dir = [f"{args.image_folder}_answers/main"]
+    eval_model(args)
