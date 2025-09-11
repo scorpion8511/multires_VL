@@ -43,7 +43,28 @@ except Exception:  # pragma: no cover - bloom helper moved or removed
                 expanded = expanded.expand(mask.size(0), 1, tgt_length, src_len)
                 inverted = 1.0 - expanded
                 return inverted.masked_fill(inverted.to(torch.bool), torch.finfo(dtype).min)
-from transformers.models.bloom.modeling_bloom import _make_causal_mask as _make_causal_mask_bloom
+try:
+    from transformers.models.bloom.modeling_bloom import _make_causal_mask as _make_causal_mask_bloom
+except Exception:  # pragma: no cover - bloom helper moved or removed
+    try:
+        from transformers.modeling_attn_mask_utils import make_causal_mask as _hf_make_causal_mask_bloom
+
+        def _make_causal_mask_bloom(input_shape, device=None, past_key_values_length=0):
+            return _hf_make_causal_mask_bloom(
+                input_shape,
+                torch.float32,
+                device=device,
+                past_key_values_length=past_key_values_length,
+            )
+    except Exception:  # pragma: no cover - no helper available
+        def _make_causal_mask_bloom(input_shape, device=None, past_key_values_length=0):
+            bsz, tgt_len = input_shape
+            mask = torch.zeros((tgt_len, tgt_len + past_key_values_length), device=device)
+            mask[:, past_key_values_length:] = torch.triu(
+                torch.full((tgt_len, tgt_len), torch.finfo(torch.float32).min, device=device),
+                diagonal=1,
+            )
+            return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 from transformers.models.bloom.modeling_bloom import logging
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from transformers.models.gpt_neo.modeling_gpt_neo import GPTNeoForCausalLM
@@ -75,7 +96,28 @@ except Exception:  # pragma: no cover - opt helper moved or removed
                 expanded = expanded.expand(mask.size(0), 1, tgt_length, src_len)
                 inverted = 1.0 - expanded
                 return inverted.masked_fill(inverted.to(torch.bool), torch.finfo(dtype).min)
-from transformers.models.opt.modeling_opt import _make_causal_mask as _make_causal_mask_opt
+try:
+    from transformers.models.opt.modeling_opt import _make_causal_mask as _make_causal_mask_opt
+except Exception:  # pragma: no cover - opt helper moved or removed
+    try:
+        from transformers.modeling_attn_mask_utils import make_causal_mask as _hf_make_causal_mask_opt
+
+        def _make_causal_mask_opt(input_shape, dtype, device=None, past_key_values_length=0):
+            return _hf_make_causal_mask_opt(
+                input_shape,
+                dtype,
+                device=device,
+                past_key_values_length=past_key_values_length,
+            )
+    except Exception:  # pragma: no cover - no helper available
+        def _make_causal_mask_opt(input_shape, dtype, device=None, past_key_values_length=0):
+            bsz, tgt_len = input_shape
+            mask = torch.zeros((tgt_len, tgt_len + past_key_values_length), dtype=dtype, device=device)
+            mask[:, past_key_values_length:] = torch.triu(
+                torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device),
+                diagonal=1,
+            )
+            return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 logger = logging.get_logger(__name__)
 _SUPPORTED_GPT_MODELS = (GPT2LMHeadModel, GPTJForCausalLM, GPTNeoForCausalLM, GPTNeoXForCausalLM)
 CAUSAL_GPT_TYPES = Union[GPT2LMHeadModel, GPTJForCausalLM, GPTNeoForCausalLM, GPTNeoXForCausalLM]
