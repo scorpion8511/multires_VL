@@ -4,19 +4,19 @@
 This script replicates the patch sampling procedure described in the
 paper referenced as ``2504.18856v1``.
 
-For each WSI slide, the script randomly selects 20 parent patches at
-5× magnification (2 µm/px) of size 512×512 pixels.  Each parent patch is
-subdivided into children at higher magnifications while keeping the same
-field of view:
+For each WSI slide, the script randomly selects 20 seed locations.  At
+each location a hierarchy of patches is extracted that all share the
+same center but differ in magnification:
 
-* 10× (1 µm/px)  : 4 children per parent
-* 20× (0.5 µm/px): 4 children per 10× child (16 total)
-* 40× (0.25 µm/px): 4 children per 20× child (64 total)
+* 5×  (2   µm/px)
+* 10× (1   µm/px)
+* 20× (0.5 µm/px)
+* 40× (0.25 µm/px)
 
-For every parent patch, all descendants (84 children + parent) form a
-"visual bag" whose structure (parent→children links) is preserved in a
-JSON file.  Alignment is only defined between a parent patch and its
-direct children.
+The resulting patches maintain spatial alignment across magnifications,
+allowing models to reason over the same region at multiple resolutions.
+The hierarchy for each seed is stored in a ``bags.json`` file alongside
+the saved patches.
 
 The script expects whole-slide images accessible via OpenSlide.
 """
@@ -46,58 +46,51 @@ def save_patch(slide: openslide.OpenSlide, x0: int, y0: int, level: int,
     img.save(out_path)
 
 
-def generate_children(slide: openslide.OpenSlide, x0: int, y0: int,
-                      level: int, size: int, target_mpps: List[float],
-                      prefix: str, out_dir: Path,
-                      base_mpp: float) -> List[Dict]:
-    """Recursively generate children patches.
+def generate_hierarchy(
+    slide: openslide.OpenSlide,
+    center_x: int,
+    center_y: int,
+    mpps: List[float],
+    prefix: str,
+    out_dir: Path,
+    base_mpp: float,
+    size: int = 512,
+) -> Dict:
+    """Generate a chain of patches centered at ``(center_x, center_y)``.
 
-    Args:
-        slide: OpenSlide object.
-        x0, y0: top-left coordinates in level 0 reference frame.
-        level: current level index.
-        size: patch size (pixels) at the current level.
-        target_mpps: list of desired mpp values for subsequent levels.
-        prefix: patch name prefix.
-        out_dir: directory in which to store patches.
-        base_mpp: level-0 microns per pixel.
-
-    Returns:
-        A list of dictionaries describing the child hierarchy.
+    The first entry in ``mpps`` corresponds to the coarsest magnification
+    (e.g. 5×).  Each subsequent entry represents a higher magnification of
+    the *same* region.  The returned dictionary has the same structure as
+    the original script: every node contains a single child describing the
+    next magnification level.
     """
-    if not target_mpps:
-        return []
 
-    current_downsample = slide.level_downsamples[level]
-    step = int(size * current_downsample / 2)
-    child_mpp = target_mpps[0]
-    child_level = slide.get_best_level_for_downsample(child_mpp / base_mpp)
+    mpp = mpps[0]
+    level = slide.get_best_level_for_downsample(mpp / base_mpp)
+    downsample = slide.level_downsamples[level]
+    x0 = int(center_x - size * downsample / 2)
+    y0 = int(center_y - size * downsample / 2)
 
-    children = []
-    offsets = [(0, 0), (1, 0), (0, 1), (1, 1)]
-    for idx, (ox, oy) in enumerate(offsets):
-        child_x0 = x0 + ox * step
-        child_y0 = y0 + oy * step
-        child_prefix = f"{prefix}_{idx}"
-        child_path = out_dir / f"{child_prefix}.png"
-        save_patch(slide, child_x0, child_y0, child_level, size, child_path)
-        grandchildren = generate_children(
+    mag_map = {2.0: "5x", 1.0: "10x", 0.5: "20x", 0.25: "40x"}
+    suffix = mag_map.get(mpp, f"{mpp:.2f}mpp")
+    patch_id = f"{prefix}_{suffix}"
+    out_path = out_dir / f"{patch_id}.png"
+    save_patch(slide, x0, y0, level, size, out_path)
+
+    node: Dict[str, object] = {"id": patch_id, "file": out_path.name, "children": []}
+    if len(mpps) > 1:
+        child = generate_hierarchy(
             slide,
-            child_x0,
-            child_y0,
-            child_level,
-            size,
-            target_mpps[1:],
-            child_prefix,
+            center_x,
+            center_y,
+            mpps[1:],
+            patch_id,
             out_dir,
             base_mpp,
+            size,
         )
-        children.append({
-            "id": child_prefix,
-            "file": child_path.name,
-            "children": grandchildren,
-        })
-    return children
+        node["children"].append(child)
+    return node
 
 
 def process_wsi(slide_path: Path, out_root: Path, num_parents: int = 20,
@@ -107,43 +100,36 @@ def process_wsi(slide_path: Path, out_root: Path, num_parents: int = 20,
     slide = openslide.OpenSlide(str(slide_path))
     base_mpp = float(slide.properties.get("openslide.mpp-x", 0.25))
 
-    parent_mpp = 2.0  # 5×
-    parent_level = pick_level(slide, parent_mpp)
-    parent_downsample = slide.level_downsamples[parent_level]
     slide_width, slide_height = slide.dimensions
-
     out_dir = out_root / slide_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bags = []
     size = 512
-    max_x = slide_width - int(size * parent_downsample)
-    max_y = slide_height - int(size * parent_downsample)
+    target_mpps = [2.0, 1.0, 0.5, 0.25]  # 5×, 10×, 20×, 40×
 
+    # Compute bounds for sampling centers so that all magnifications fit
+    parent_level = pick_level(slide, target_mpps[0])
+    parent_downsample = slide.level_downsamples[parent_level]
+    margin = int(size * parent_downsample / 2)
+    max_cx = slide_width - margin
+    max_cy = slide_height - margin
+
+    bags = []
     for i in range(num_parents):
-        x0 = random.randint(0, max_x)
-        y0 = random.randint(0, max_y)
-        parent_name = f"parent_{i}"
-        parent_path = out_dir / f"{parent_name}.png"
-        save_patch(slide, x0, y0, parent_level, size, parent_path)
-
-        children = generate_children(
+        center_x = random.randint(margin, max_cx)
+        center_y = random.randint(margin, max_cy)
+        prefix = f"patch_{i}"
+        bag = generate_hierarchy(
             slide,
-            x0,
-            y0,
-            parent_level,
-            size,
-            [1.0, 0.5, 0.25],
-            parent_name,
+            center_x,
+            center_y,
+            target_mpps,
+            prefix,
             out_dir,
             base_mpp,
+            size,
         )
-
-        bags.append({
-            "id": parent_name,
-            "file": parent_path.name,
-            "children": children,
-        })
+        bags.append(bag)
 
     with open(out_dir / "bags.json", "w") as f:
         json.dump(bags, f, indent=2)
