@@ -19,6 +19,8 @@ The hierarchy for each seed is stored in a ``bags.json`` file alongside
 the saved patches.
 
 The script expects whole-slide images accessible via OpenSlide.
+If a slide omits some pyramid levels, regions are resized so that each
+output patch still reflects the requested field of view.
 """
 
 from __future__ import annotations
@@ -30,19 +32,29 @@ from pathlib import Path
 from typing import Dict, List
 
 import openslide
+from PIL import Image
 
 
-def pick_level(slide: openslide.OpenSlide, target_mpp: float) -> int:
-    """Return the best level index approximating ``target_mpp``."""
-    base_mpp = float(slide.properties.get("openslide.mpp-x", 0.25))
-    downsample = target_mpp / base_mpp
-    return slide.get_best_level_for_downsample(downsample)
+def save_patch(
+    slide: openslide.OpenSlide,
+    center_x: int,
+    center_y: int,
+    level: int,
+    size: int,
+    requested_ds: float,
+    out_path: Path,
+) -> None:
+    """Read and save a region from ``slide`` at the desired downsample."""
 
+    actual_ds = slide.level_downsamples[level]
+    # Compute region in level-0 coordinates covering the requested area
+    x0 = int(center_x - size * requested_ds / 2)
+    y0 = int(center_y - size * requested_ds / 2)
+    region_size = int(size * requested_ds / actual_ds)
 
-def save_patch(slide: openslide.OpenSlide, x0: int, y0: int, level: int,
-               size: int, out_path: Path) -> None:
-    """Read and save a region from ``slide``."""
-    img = slide.read_region((x0, y0), level, (size, size)).convert("RGB")
+    img = slide.read_region((x0, y0), level, (region_size, region_size)).convert("RGB")
+    if region_size != size:
+        img = img.resize((size, size), Image.BILINEAR)
     img.save(out_path)
 
 
@@ -66,16 +78,14 @@ def generate_hierarchy(
     """
 
     mpp = mpps[0]
-    level = slide.get_best_level_for_downsample(mpp / base_mpp)
-    downsample = slide.level_downsamples[level]
-    x0 = int(center_x - size * downsample / 2)
-    y0 = int(center_y - size * downsample / 2)
+    requested_ds = mpp / base_mpp
+    level = slide.get_best_level_for_downsample(requested_ds)
 
     mag_map = {2.0: "5x", 1.0: "10x", 0.5: "20x", 0.25: "40x"}
     suffix = mag_map.get(mpp, f"{mpp:.2f}mpp")
     patch_id = f"{prefix}_{suffix}"
     out_path = out_dir / f"{patch_id}.png"
-    save_patch(slide, x0, y0, level, size, out_path)
+    save_patch(slide, center_x, center_y, level, size, requested_ds, out_path)
 
     node: Dict[str, object] = {"id": patch_id, "file": out_path.name, "children": []}
     if len(mpps) > 1:
@@ -108,9 +118,8 @@ def process_wsi(slide_path: Path, out_root: Path, num_parents: int = 20,
     target_mpps = [2.0, 1.0, 0.5, 0.25]  # 5×, 10×, 20×, 40×
 
     # Compute bounds for sampling centers so that all magnifications fit
-    parent_level = pick_level(slide, target_mpps[0])
-    parent_downsample = slide.level_downsamples[parent_level]
-    margin = int(size * parent_downsample / 2)
+    parent_ds = target_mpps[0] / base_mpp
+    margin = int(size * parent_ds / 2)
     max_cx = slide_width - margin
     max_cy = slide_height - margin
 
