@@ -29,10 +29,23 @@ import argparse
 import json
 import random
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import openslide
 from PIL import Image
+import numpy as np
+
+
+def compute_tissue_fraction(img: Image.Image, background_threshold: int = 220) -> float:
+    """Return the fraction of pixels that are likely to be tissue.
+
+    Pixels lighter than ``background_threshold`` (in grayscale) are considered
+    background and excluded from the tissue count.
+    """
+
+    gray = np.array(img.convert("L"))
+    tissue_mask = gray < background_threshold
+    return float(tissue_mask.mean())
 
 
 def save_patch(
@@ -43,8 +56,10 @@ def save_patch(
     size: int,
     requested_ds: float,
     out_path: Path,
-) -> None:
-    """Read and save a region from ``slide`` at the desired downsample."""
+    tissue_threshold: float,
+    background_threshold: int,
+) -> Optional[Path]:
+    """Read and save a region from ``slide`` if it contains sufficient tissue."""
 
     actual_ds = slide.level_downsamples[level]
     # Compute region in level-0 coordinates covering the requested area
@@ -55,7 +70,11 @@ def save_patch(
     img = slide.read_region((x0, y0), level, (region_size, region_size)).convert("RGB")
     if region_size != size:
         img = img.resize((size, size), Image.BILINEAR)
+    tissue_fraction = compute_tissue_fraction(img, background_threshold)
+    if tissue_fraction < tissue_threshold:
+        return None
     img.save(out_path)
+    return out_path
 
 
 def generate_hierarchy(
@@ -67,7 +86,9 @@ def generate_hierarchy(
     out_dir: Path,
     base_mpp: float,
     size: int = 512,
-) -> Dict:
+    tissue_threshold: float = 0.75,
+    background_threshold: int = 220,
+) -> Optional[Dict[str, object]]:
     """Generate a chain of patches centered at ``(center_x, center_y)``.
 
     The first entry in ``mpps`` corresponds to the coarsest magnification
@@ -85,7 +106,19 @@ def generate_hierarchy(
     suffix = mag_map.get(mpp, f"{mpp:.2f}mpp")
     patch_id = f"{prefix}_{suffix}"
     out_path = out_dir / f"{patch_id}.png"
-    save_patch(slide, center_x, center_y, level, size, requested_ds, out_path)
+    saved_path = save_patch(
+        slide,
+        center_x,
+        center_y,
+        level,
+        size,
+        requested_ds,
+        out_path,
+        tissue_threshold,
+        background_threshold,
+    )
+    if saved_path is None:
+        return None
 
     node: Dict[str, object] = {"id": patch_id, "file": out_path.name, "children": []}
     if len(mpps) > 1:
@@ -98,13 +131,22 @@ def generate_hierarchy(
             out_dir,
             base_mpp,
             size,
+            tissue_threshold,
+            background_threshold,
         )
+        if not child:
+            try:
+                out_path.unlink()
+            except FileNotFoundError:
+                pass
+            return None
         node["children"].append(child)
     return node
 
 
 def process_wsi(slide_path: Path, out_root: Path, num_parents: int = 20,
-                seed: int = 0) -> None:
+                seed: int = 0, tissue_threshold: float = 0.75,
+                background_threshold: int = 220) -> None:
     """Process a single WSI and generate multi-scale patch bags."""
     random.seed(seed)
     slide = openslide.OpenSlide(str(slide_path))
@@ -124,7 +166,11 @@ def process_wsi(slide_path: Path, out_root: Path, num_parents: int = 20,
     max_cy = slide_height - margin
 
     bags = []
-    for i in range(num_parents):
+    i = 0
+    attempts = 0
+    max_attempts = num_parents * 20 if num_parents > 0 else 0
+    while i < num_parents and (max_attempts == 0 or attempts < max_attempts):
+        attempts += 1
         center_x = random.randint(margin, max_cx)
         center_y = random.randint(margin, max_cy)
         prefix = f"patch_{i}"
@@ -137,8 +183,18 @@ def process_wsi(slide_path: Path, out_root: Path, num_parents: int = 20,
             out_dir,
             base_mpp,
             size,
+            tissue_threshold,
+            background_threshold,
         )
-        bags.append(bag)
+        if bag:
+            bags.append(bag)
+            i += 1
+
+    if i < num_parents:
+        print(
+            f"Warning: only collected {i} patch bags (requested {num_parents}) "
+            f"for {slide_path.name}."
+        )
 
     with open(out_dir / "bags.json", "w") as f:
         json.dump(bags, f, indent=2)
@@ -170,6 +226,18 @@ def main() -> None:
     parser.add_argument("--num_parents", type=int, default=20,
                         help="Number of parent patches per slide")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument(
+        "--tissue-threshold",
+        type=float,
+        default=0.75,
+        help="Minimum tissue fraction required to keep a patch",
+    )
+    parser.add_argument(
+        "--background-threshold",
+        type=int,
+        default=220,
+        help="Grayscale threshold separating tissue from background",
+    )
 
     args = parser.parse_args()
 
@@ -184,6 +252,8 @@ def main() -> None:
             args.out_dir,
             num_parents=args.num_parents,
             seed=args.seed,
+            tissue_threshold=args.tissue_threshold,
+            background_threshold=args.background_threshold,
         )
 
 
