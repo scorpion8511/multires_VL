@@ -26,10 +26,12 @@ output patch still reflects the requested field of view.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import openslide
 from PIL import Image
@@ -214,6 +216,104 @@ def gather_slides(wsi_root: Path) -> List[Path]:
     return [p for p in wsi_root.rglob("*") if p.suffix.lower() in exts]
 
 
+def load_metadata_table(csv_path: Path) -> Tuple[List[Dict[str, str]], Sequence[str]]:
+    """Read ``csv_path`` and return a list of row dictionaries."""
+
+    with csv_path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        rows = [dict(row) for row in reader]
+        if not rows:
+            raise ValueError(f"Metadata file {csv_path} is empty")
+        return rows, reader.fieldnames or []
+
+
+def select_balanced_subset(
+    rows: Iterable[Dict[str, str]],
+    subtype_col: str,
+    total: int,
+    seed: int,
+) -> List[Dict[str, str]]:
+    """Select ``total`` rows with equal representation of each subtype."""
+
+    grouped: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        if subtype_col not in row:
+            raise KeyError(f"Column '{subtype_col}' not found in metadata")
+        grouped[row[subtype_col]].append(row)
+
+    if not grouped:
+        raise ValueError("No subtypes found in metadata table")
+
+    num_subtypes = len(grouped)
+    if total % num_subtypes != 0:
+        raise ValueError(
+            "Cannot select an equal number of WSIs per subtype: "
+            f"requested {total} slides across {num_subtypes} subtypes."
+        )
+
+    per_subtype = total // num_subtypes
+    rng = random.Random(seed)
+    selected: List[Dict[str, str]] = []
+    for subtype, items in grouped.items():
+        if len(items) < per_subtype:
+            raise ValueError(
+                f"Not enough entries for subtype '{subtype}': "
+                f"required {per_subtype}, found {len(items)}"
+            )
+        selected.extend(rng.sample(items, per_subtype))
+
+    rng.shuffle(selected)
+    return selected
+
+
+def resolve_selected_slides(
+    slides: Sequence[Path],
+    selected_rows: Sequence[Dict[str, str]],
+    path_column: str,
+) -> List[Tuple[Path, Dict[str, str]]]:
+    """Match selected metadata rows to slide paths."""
+
+    if not slides:
+        return []
+
+    by_name = {p.name: p for p in slides}
+    by_stem: Dict[str, List[Path]] = defaultdict(list)
+    for slide in slides:
+        by_stem[slide.stem].append(slide)
+
+    resolved: List[Tuple[Path, Dict[str, str]]] = []
+    missing: List[str] = []
+    for row in selected_rows:
+        if path_column not in row:
+            raise KeyError(f"Column '{path_column}' not found in metadata")
+        raw_value = row[path_column]
+        if not raw_value:
+            missing.append("<empty>")
+            continue
+        filename = Path(raw_value).name
+        slide_path = by_name.get(filename)
+        if slide_path is None:
+            stem_matches = by_stem.get(Path(filename).stem, [])
+            if len(stem_matches) == 1:
+                slide_path = stem_matches[0]
+            elif len(stem_matches) > 1:
+                raise ValueError(
+                    f"Multiple slide files match '{raw_value}'. Please disambiguate."
+                )
+        if slide_path is None:
+            missing.append(raw_value)
+        else:
+            resolved.append((slide_path, row))
+
+    if missing:
+        raise FileNotFoundError(
+            "Slides listed in metadata were not found under the provided directory: "
+            + ", ".join(sorted(set(missing)))
+        )
+
+    return resolved
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Sample multi-resolution patch bags from WSIs")
@@ -238,6 +338,29 @@ def main() -> None:
         default=220,
         help="Grayscale threshold separating tissue from background",
     )
+    parser.add_argument(
+        "--metadata-csv",
+        type=Path,
+        help="CSV file describing slides and their subtypes",
+    )
+    parser.add_argument(
+        "--metadata-subtype-column",
+        type=str,
+        default="subtype",
+        help="Column in the metadata CSV that stores subtype labels",
+    )
+    parser.add_argument(
+        "--metadata-path-column",
+        type=str,
+        default="pathology_id",
+        help="Column in the metadata CSV that stores slide file names",
+    )
+    parser.add_argument(
+        "--num-wsi",
+        type=int,
+        default=50,
+        help="Number of WSIs to sample evenly across subtypes",
+    )
 
     args = parser.parse_args()
 
@@ -245,7 +368,46 @@ def main() -> None:
     if not slides:
         raise FileNotFoundError(f"No WSI files found at {args.wsi_dir}")
 
-    for slide_path in slides:
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_rows: Optional[List[Dict[str, str]]] = None
+    if args.metadata_csv is not None:
+        metadata_rows, fieldnames = load_metadata_table(args.metadata_csv)
+        selected_rows = select_balanced_subset(
+            metadata_rows,
+            args.metadata_subtype_column,
+            args.num_wsi,
+            args.seed,
+        )
+        resolved = resolve_selected_slides(
+            slides,
+            selected_rows,
+            args.metadata_path_column,
+        )
+        slides_to_process = [path for path, _ in resolved]
+        if len(slides_to_process) != len(selected_rows):
+            raise RuntimeError("Mismatch between selected metadata rows and slide paths")
+
+        output_fields: Sequence[str] = (
+            list(fieldnames) if fieldnames else list(selected_rows[0].keys())
+        )
+        if "resolved_path" not in output_fields:
+            output_fields = list(output_fields) + ["resolved_path"]
+        selected_csv_path = args.out_dir / "selected_wsi.csv"
+        with selected_csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=output_fields)
+            writer.writeheader()
+            for slide_path, row in resolved:
+                row_out = dict(row)
+                row_out["resolved_path"] = str(slide_path)
+                writer.writerow(row_out)
+    else:
+        slides_to_process = slides
+
+    if not slides_to_process:
+        raise FileNotFoundError("No slides matched the selection criteria")
+
+    for slide_path in slides_to_process:
         print(f"Processing {slide_path}")
         process_wsi(
             slide_path,
