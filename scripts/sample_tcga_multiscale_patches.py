@@ -227,24 +227,84 @@ def load_metadata_table(csv_path: Path) -> Tuple[List[Dict[str, str]], Sequence[
         return rows, reader.fieldnames or []
 
 
-def select_balanced_subset(
+def _index_slide_paths(slides: Sequence[Path]) -> Tuple[Dict[str, Path], Dict[str, List[Path]]]:
+    """Return lookup tables for slide files keyed by name and stem."""
+
+    by_name = {p.name: p for p in slides}
+    by_stem: Dict[str, List[Path]] = defaultdict(list)
+    for slide in slides:
+        by_stem[slide.stem].append(slide)
+    return by_name, by_stem
+
+
+def _match_slide_path(
+    raw_value: str,
+    by_name: Dict[str, Path],
+    by_stem: Dict[str, List[Path]],
+) -> Optional[Path]:
+    """Resolve ``raw_value`` to a slide ``Path`` if possible."""
+
+    if not raw_value:
+        return None
+
+    filename = Path(raw_value).name
+    slide_path = by_name.get(filename)
+    if slide_path is not None:
+        return slide_path
+
+    stem_matches = by_stem.get(Path(filename).stem, [])
+    if len(stem_matches) == 1:
+        return stem_matches[0]
+    if len(stem_matches) > 1:
+        raise ValueError(
+            f"Multiple slide files match '{raw_value}'. Please disambiguate."
+        )
+    return None
+
+
+def select_balanced_slide_subset(
     rows: Iterable[Dict[str, str]],
     subtype_col: str,
+    path_column: str,
     total: int,
     seed: int,
-) -> List[Dict[str, str]]:
-    """Select ``total`` rows with equal representation of each subtype."""
+    slides: Sequence[Path],
+) -> List[Tuple[Path, Dict[str, str]]]:
+    """Select ``total`` slide/metadata pairs with equal subtype representation."""
 
-    grouped: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    if not slides:
+        return []
+
+    by_name, by_stem = _index_slide_paths(slides)
+
+    grouped: Dict[str, List[Tuple[Path, Dict[str, str]]]] = defaultdict(list)
+    all_subtypes: set[str] = set()
+    skipped: Dict[str, int] = defaultdict(int)
+
     for row in rows:
         if subtype_col not in row:
             raise KeyError(f"Column '{subtype_col}' not found in metadata")
-        grouped[row[subtype_col]].append(row)
+        if path_column not in row:
+            raise KeyError(f"Column '{path_column}' not found in metadata")
 
-    if not grouped:
+        subtype = row[subtype_col]
+        all_subtypes.add(subtype)
+        raw_value = row[path_column]
+        slide_path = _match_slide_path(raw_value, by_name, by_stem)
+        if slide_path is None:
+            skipped[raw_value or "<empty>"] += 1
+            continue
+
+        existing_paths = {path for path, _ in grouped[subtype]}
+        if slide_path in existing_paths:
+            continue
+
+        grouped[subtype].append((slide_path, row))
+
+    if not all_subtypes:
         raise ValueError("No subtypes found in metadata table")
 
-    num_subtypes = len(grouped)
+    num_subtypes = len(all_subtypes)
     if total % num_subtypes != 0:
         raise ValueError(
             "Cannot select an equal number of WSIs per subtype: "
@@ -252,66 +312,32 @@ def select_balanced_subset(
         )
 
     per_subtype = total // num_subtypes
-    rng = random.Random(seed)
-    selected: List[Dict[str, str]] = []
-    for subtype, items in grouped.items():
-        if len(items) < per_subtype:
+
+    for subtype in sorted(all_subtypes):
+        available = grouped.get(subtype, [])
+        if len(available) < per_subtype:
             raise ValueError(
-                f"Not enough entries for subtype '{subtype}': "
-                f"required {per_subtype}, found {len(items)}"
+                f"Not enough resolvable slides for subtype '{subtype}': "
+                f"required {per_subtype}, found {len(available)}"
             )
-        selected.extend(rng.sample(items, per_subtype))
+
+    total_skipped = sum(skipped.values())
+    if total_skipped:
+        skipped_examples = ", ".join(sorted(skipped.keys())[:5])
+        print(
+            "Warning: skipped "
+            f"{total_skipped} metadata rows without matching slides"
+            f" (examples: {skipped_examples})."
+        )
+
+    rng = random.Random(seed)
+    selected: List[Tuple[Path, Dict[str, str]]] = []
+    for subtype in sorted(all_subtypes):
+        candidates = grouped[subtype]
+        selected.extend(rng.sample(candidates, per_subtype))
 
     rng.shuffle(selected)
     return selected
-
-
-def resolve_selected_slides(
-    slides: Sequence[Path],
-    selected_rows: Sequence[Dict[str, str]],
-    path_column: str,
-) -> List[Tuple[Path, Dict[str, str]]]:
-    """Match selected metadata rows to slide paths."""
-
-    if not slides:
-        return []
-
-    by_name = {p.name: p for p in slides}
-    by_stem: Dict[str, List[Path]] = defaultdict(list)
-    for slide in slides:
-        by_stem[slide.stem].append(slide)
-
-    resolved: List[Tuple[Path, Dict[str, str]]] = []
-    missing: List[str] = []
-    for row in selected_rows:
-        if path_column not in row:
-            raise KeyError(f"Column '{path_column}' not found in metadata")
-        raw_value = row[path_column]
-        if not raw_value:
-            missing.append("<empty>")
-            continue
-        filename = Path(raw_value).name
-        slide_path = by_name.get(filename)
-        if slide_path is None:
-            stem_matches = by_stem.get(Path(filename).stem, [])
-            if len(stem_matches) == 1:
-                slide_path = stem_matches[0]
-            elif len(stem_matches) > 1:
-                raise ValueError(
-                    f"Multiple slide files match '{raw_value}'. Please disambiguate."
-                )
-        if slide_path is None:
-            missing.append(raw_value)
-        else:
-            resolved.append((slide_path, row))
-
-    if missing:
-        raise FileNotFoundError(
-            "Slides listed in metadata were not found under the provided directory: "
-            + ", ".join(sorted(set(missing)))
-        )
-
-    return resolved
 
 
 def main() -> None:
@@ -373,20 +399,16 @@ def main() -> None:
     selected_rows: Optional[List[Dict[str, str]]] = None
     if args.metadata_csv is not None:
         metadata_rows, fieldnames = load_metadata_table(args.metadata_csv)
-        selected_rows = select_balanced_subset(
+        selected_pairs = select_balanced_slide_subset(
             metadata_rows,
             args.metadata_subtype_column,
+            args.metadata_path_column,
             args.num_wsi,
             args.seed,
-        )
-        resolved = resolve_selected_slides(
             slides,
-            selected_rows,
-            args.metadata_path_column,
         )
-        slides_to_process = [path for path, _ in resolved]
-        if len(slides_to_process) != len(selected_rows):
-            raise RuntimeError("Mismatch between selected metadata rows and slide paths")
+        slides_to_process = [path for path, _ in selected_pairs]
+        selected_rows = [row for _, row in selected_pairs]
 
         output_fields: Sequence[str] = (
             list(fieldnames) if fieldnames else list(selected_rows[0].keys())
@@ -397,7 +419,7 @@ def main() -> None:
         with selected_csv_path.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=output_fields)
             writer.writeheader()
-            for slide_path, row in resolved:
+            for slide_path, row in selected_pairs:
                 row_out = dict(row)
                 row_out["resolved_path"] = str(slide_path)
                 writer.writerow(row_out)
