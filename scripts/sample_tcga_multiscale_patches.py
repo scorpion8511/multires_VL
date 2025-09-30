@@ -29,7 +29,9 @@ import argparse
 import csv
 import json
 import random
+import shutil
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -146,10 +148,18 @@ def generate_hierarchy(
     return node
 
 
-def process_wsi(slide_path: Path, out_root: Path, num_parents: int = 20,
-                seed: int = 0, tissue_threshold: float = 0.75,
-                background_threshold: int = 220) -> None:
-    """Process a single WSI and generate multi-scale patch bags."""
+def process_wsi(
+    slide_path: Path,
+    out_root: Path,
+    num_parents: int = 20,
+    seed: int = 0,
+    tissue_threshold: float = 0.75,
+    background_threshold: int = 220,
+) -> int:
+    """Process a single WSI and generate multi-scale patch bags.
+
+    Returns the number of patch bags successfully collected.
+    """
     random.seed(seed)
     slide = openslide.OpenSlide(str(slide_path))
     base_mpp = float(slide.properties.get("openslide.mpp-x", 0.25))
@@ -203,6 +213,8 @@ def process_wsi(slide_path: Path, out_root: Path, num_parents: int = 20,
 
     slide.close()
 
+    return len(bags)
+
 
 def gather_slides(wsi_root: Path) -> List[Path]:
     """Return a list of WSI files under ``wsi_root``.
@@ -225,6 +237,16 @@ def load_metadata_table(csv_path: Path) -> Tuple[List[Dict[str, str]], Sequence[
         if not rows:
             raise ValueError(f"Metadata file {csv_path} is empty")
         return rows, reader.fieldnames or []
+
+
+@dataclass
+class BalancedSelection:
+    """Container describing balanced slide sampling results."""
+
+    initial: List[Tuple[Path, Dict[str, str]]]
+    extras: Dict[str, List[Tuple[Path, Dict[str, str]]]]
+    per_subtype: int
+    subtypes: List[str]
 
 
 def _index_slide_paths(slides: Sequence[Path]) -> Tuple[Dict[str, Path], Dict[str, List[Path]]]:
@@ -269,7 +291,7 @@ def select_balanced_slide_subset(
     total: int,
     seed: int,
     slides: Sequence[Path],
-) -> List[Tuple[Path, Dict[str, str]]]:
+) -> BalancedSelection:
     """Select ``total`` slide/metadata pairs with equal subtype representation."""
 
     if not slides:
@@ -331,13 +353,24 @@ def select_balanced_slide_subset(
         )
 
     rng = random.Random(seed)
-    selected: List[Tuple[Path, Dict[str, str]]] = []
-    for subtype in sorted(all_subtypes):
-        candidates = grouped[subtype]
-        selected.extend(rng.sample(candidates, per_subtype))
+    subtype_order = sorted(all_subtypes)
+    initial: List[Tuple[Path, Dict[str, str]]] = []
+    extras: Dict[str, List[Tuple[Path, Dict[str, str]]]] = {}
 
-    rng.shuffle(selected)
-    return selected
+    for subtype in subtype_order:
+        candidates = list(grouped[subtype])
+        rng.shuffle(candidates)
+        initial.extend(candidates[:per_subtype])
+        extras[subtype] = candidates[per_subtype:]
+
+    rng.shuffle(initial)
+
+    return BalancedSelection(
+        initial=initial,
+        extras=extras,
+        per_subtype=per_subtype,
+        subtypes=subtype_order,
+    )
 
 
 def main() -> None:
@@ -396,10 +429,9 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    selected_rows: Optional[List[Dict[str, str]]] = None
     if args.metadata_csv is not None:
         metadata_rows, fieldnames = load_metadata_table(args.metadata_csv)
-        selected_pairs = select_balanced_slide_subset(
+        selection = select_balanced_slide_subset(
             metadata_rows,
             args.metadata_subtype_column,
             args.metadata_path_column,
@@ -407,11 +439,73 @@ def main() -> None:
             args.seed,
             slides,
         )
-        slides_to_process = [path for path, _ in selected_pairs]
-        selected_rows = [row for _, row in selected_pairs]
+        counts = {subtype: 0 for subtype in selection.subtypes}
+        accepted_pairs: List[Tuple[Path, Dict[str, str]]] = []
+
+        def process_candidate(
+            pair: Tuple[Path, Dict[str, str]], *, is_replacement: bool = False
+        ) -> bool:
+            slide_path, row = pair
+            subtype = row[args.metadata_subtype_column]
+            print(f"Processing {slide_path}")
+            bags_collected = process_wsi(
+                slide_path,
+                args.out_dir,
+                num_parents=args.num_parents,
+                seed=args.seed,
+                tissue_threshold=args.tissue_threshold,
+                background_threshold=args.background_threshold,
+            )
+            if bags_collected < args.num_parents:
+                slide_out_dir = args.out_dir / slide_path.stem
+                if slide_out_dir.exists():
+                    shutil.rmtree(slide_out_dir, ignore_errors=True)
+                reason = "replacement" if is_replacement else "selected"
+                print(
+                    f"Scheduling an additional slide for subtype '{subtype}' "
+                    f"because {slide_path.name} ({reason}) yielded "
+                    f"{bags_collected} patch bags."
+                )
+                return False
+
+            counts[subtype] += 1
+            accepted_pairs.append(pair)
+            return True
+
+        for pair in selection.initial:
+            process_candidate(pair)
+
+        for subtype in selection.subtypes:
+            while counts[subtype] < selection.per_subtype:
+                extras = selection.extras[subtype]
+                if not extras:
+                    raise RuntimeError(
+                        "Ran out of candidate slides for subtype "
+                        f"'{subtype}' while attempting to collect "
+                        f"{selection.per_subtype} slides with at least "
+                        f"{args.num_parents} patch bags."
+                    )
+                replacement_pair = extras.pop()
+                process_candidate(replacement_pair, is_replacement=True)
+
+        if any(count < selection.per_subtype for count in counts.values()):
+            raise RuntimeError(
+                "Unable to assemble the requested balanced subset with "
+                f"{args.num_parents} patch bags per slide."
+            )
+
+        expected_total = selection.per_subtype * len(selection.subtypes)
+        if len(accepted_pairs) != expected_total:
+            raise RuntimeError(
+                "Internal error: collected slide count does not match the "
+                "requested balanced sample size."
+            )
+
+        if not accepted_pairs:
+            raise RuntimeError("No slides produced the required patch bags")
 
         output_fields: Sequence[str] = (
-            list(fieldnames) if fieldnames else list(selected_rows[0].keys())
+            list(fieldnames) if fieldnames else list(accepted_pairs[0][1].keys())
         )
         if "resolved_path" not in output_fields:
             output_fields = list(output_fields) + ["resolved_path"]
@@ -419,26 +513,21 @@ def main() -> None:
         with selected_csv_path.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=output_fields)
             writer.writeheader()
-            for slide_path, row in selected_pairs:
+            for slide_path, row in accepted_pairs:
                 row_out = dict(row)
                 row_out["resolved_path"] = str(slide_path)
                 writer.writerow(row_out)
     else:
-        slides_to_process = slides
-
-    if not slides_to_process:
-        raise FileNotFoundError("No slides matched the selection criteria")
-
-    for slide_path in slides_to_process:
-        print(f"Processing {slide_path}")
-        process_wsi(
-            slide_path,
-            args.out_dir,
-            num_parents=args.num_parents,
-            seed=args.seed,
-            tissue_threshold=args.tissue_threshold,
-            background_threshold=args.background_threshold,
-        )
+        for slide_path in slides:
+            print(f"Processing {slide_path}")
+            process_wsi(
+                slide_path,
+                args.out_dir,
+                num_parents=args.num_parents,
+                seed=args.seed,
+                tissue_threshold=args.tissue_threshold,
+                background_threshold=args.background_threshold,
+            )
 
 
 if __name__ == "__main__":
