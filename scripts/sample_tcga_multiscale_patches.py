@@ -190,14 +190,59 @@ def _unique_paths(paths: Sequence[Path]) -> List[Path]:
     return unique
 
 
+def index_annotation_files(
+    annotation_root: Optional[Path],
+) -> Dict[str, List[Path]]:
+    """Return a lookup table for annotation XMLs keyed by lowercase names."""
+
+    lookup: Dict[str, List[Path]] = defaultdict(list)
+
+    def _register(key: str, path: Path) -> None:
+        entries = lookup[key]
+        if path in entries:
+            return
+        if entries:
+            print(
+                "Warning: multiple annotation files map to key '"
+                f"{key}' (including {entries[0]} and {path})."
+            )
+        entries.append(path)
+
+    if annotation_root is None:
+        return lookup
+
+    if annotation_root.is_file():
+        key_stem = annotation_root.stem.lower()
+        key_name = annotation_root.name.lower()
+        _register(key_stem, annotation_root)
+        _register(key_name, annotation_root)
+        return lookup
+
+    if annotation_root.is_dir():
+        for xml_path in annotation_root.rglob("*.xml"):
+            key_stem = xml_path.stem.lower()
+            key_name = xml_path.name.lower()
+            _register(key_stem, xml_path)
+            _register(key_name, xml_path)
+
+    return lookup
+
+
 def load_slide_polygons(
     slide_path: Path,
     annotation_root: Optional[Path],
+    annotation_lookup: Optional[Dict[str, List[Path]]] = None,
 ) -> List[List[Tuple[float, float]]]:
     """Return polygons for ``slide_path`` if an annotation XML is available."""
 
     candidates: List[Path] = []
-    if annotation_root is not None:
+    normalized_keys = {slide_path.stem.lower(), slide_path.name.lower()}
+
+    if annotation_lookup:
+        for key in normalized_keys:
+            candidates.extend(annotation_lookup.get(key, []))
+
+    if annotation_root is not None and not candidates:
         if annotation_root.is_file():
             candidates.append(annotation_root)
         elif annotation_root.is_dir():
@@ -209,11 +254,19 @@ def load_slide_polygons(
                     annotation_root / f"{slide_path.stem.lower()}.xml",
                 ]
             )
-    candidates.append(slide_path.with_suffix(".xml"))
 
-    for candidate in _unique_paths(candidates):
+    annotation_candidates = _unique_paths(candidates)
+    candidate_keys = {path.resolve() for path in annotation_candidates if path.exists()}
+
+    fallback_candidate = slide_path.with_suffix(".xml")
+    combined_candidates = annotation_candidates + [fallback_candidate]
+
+    matched_annotation = False
+    for candidate in _unique_paths(combined_candidates):
         if not candidate.exists() or not candidate.is_file():
             continue
+        if candidate.resolve() in candidate_keys:
+            matched_annotation = True
         polygons = parse_aperio_xml(candidate)
         if polygons:
             return polygons
@@ -222,6 +275,13 @@ def load_slide_polygons(
                 f"Warning: annotation file {candidate} does not contain "
                 "any polygon regions."
             )
+
+    if annotation_root is not None and annotation_candidates and not matched_annotation:
+        print(
+            "Warning: no matching annotation XML found for "
+            f"{slide_path.name} in {annotation_root}."
+        )
+
     return []
 
 
@@ -661,6 +721,7 @@ def main() -> None:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     annotation_root = resolve_annotation_root(args.annotation_dir)
+    annotation_lookup = index_annotation_files(annotation_root)
 
     if args.metadata_csv is not None:
         metadata_rows, fieldnames = load_metadata_table(args.metadata_csv)
@@ -684,6 +745,7 @@ def main() -> None:
             annotation_polygons = load_slide_polygons(
                 slide_path,
                 annotation_root,
+                annotation_lookup,
             )
             bags_collected = process_wsi(
                 slide_path,
@@ -761,6 +823,7 @@ def main() -> None:
             annotation_polygons = load_slide_polygons(
                 slide_path,
                 annotation_root,
+                annotation_lookup,
             )
             process_wsi(
                 slide_path,
