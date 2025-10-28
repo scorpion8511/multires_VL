@@ -64,15 +64,28 @@ class PatchTile:
 
 
 class ValueLabelEncoder:
-    """Assign deterministic integer labels to string values."""
+    """Assign deterministic integer labels to known annotation values."""
 
-    def __init__(self) -> None:
-        self._mapping: Dict[str, int] = {}
+    DEFAULT_MAPPING = {
+        "normal": 0,
+        "benign": 1,
+        "in situ carcinoma": 2,
+        "invasive carcinoma": 3,
+    }
+
+    def __init__(self, mapping: Optional[Dict[str, int]] = None) -> None:
+        source = mapping or self.DEFAULT_MAPPING
+        self._mapping: Dict[str, int] = {k.lower(): v for k, v in source.items()}
 
     def encode(self, value: str) -> int:
-        key = value.strip()
+        key = value.strip().lower()
+        if not key:
+            raise ValueError("Cannot encode an empty annotation value")
         if key not in self._mapping:
-            self._mapping[key] = len(self._mapping)
+            raise KeyError(
+                f"Annotation value '{value}' does not match any known subtype "
+                f"labels ({', '.join(sorted(self._mapping))})."
+            )
         return self._mapping[key]
 
 
@@ -550,12 +563,25 @@ def process_wsi(
         if bag:
             bag_node, tiles = bag
             bags.append(bag_node)
-            region_value = selected_region.value.strip() if selected_region and selected_region.value else ""
+            region_value = (
+                selected_region.value.strip()
+                if selected_region and selected_region.value
+                else ""
+            )
+            label_str = ""
             if region_value and label_encoder is not None:
-                label_id = label_encoder.encode(region_value)
-                label_str = str(label_id)
-            else:
-                label_str = ""
+                try:
+                    label_id = label_encoder.encode(region_value)
+                except (KeyError, ValueError) as exc:
+                    print(
+                        "Warning:",
+                        exc,
+                        "-- leaving label empty for",
+                        slide_path.name,
+                        f"(bag {i}).",
+                    )
+                else:
+                    label_str = str(label_id)
             for tile in tiles:
                 patch_rows.append(
                     {
