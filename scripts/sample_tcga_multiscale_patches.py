@@ -69,8 +69,8 @@ class ValueLabelEncoder:
     DEFAULT_MAPPING = {
         "normal": (0, "Normal"),
         "benign": (1, "Benign"),
-        "in situ carcinoma": (2, "In situ carcinoma"),
-        "carcinoma in situ": (2, "In situ carcinoma"),
+        "in situ carcinoma": (2, "Carcinoma in situ"),
+        "carcinoma in situ": (2, "Carcinoma in situ"),
         "invasive carcinoma": (3, "Invasive carcinoma"),
     }
 
