@@ -71,26 +71,43 @@ class ValueLabelEncoder:
         "benign": (1, "Benign"),
         "in situ carcinoma": (2, "in situ carcinoma"),
         "carcinoma in situ": (2, "in situ carcinoma"),
+        "carcinoma in-situ": (2, "in situ carcinoma"),
+        "in-situ carcinoma": (2, "in situ carcinoma"),
+        "in situ": (2, "in situ carcinoma"),
         "situ": (2, "in situ carcinoma"),
+        "carcinoma situ": (2, "in situ carcinoma"),
         "invasive carcinoma": (3, "Invasive carcinoma"),
+        "carcinoma invasive": (3, "Invasive carcinoma"),
     }
+
+    @staticmethod
+    def _normalize(value: str) -> str:
+        normalized = value.lower().replace("-", " ")
+        normalized = " ".join(normalized.split())
+        return normalized
 
     def __init__(
         self, mapping: Optional[Dict[str, Tuple[int, str] | int]] = None
     ) -> None:
         source = mapping or self.DEFAULT_MAPPING
         processed: Dict[str, Tuple[int, str]] = {}
+        token_map: Dict[Tuple[str, ...], Tuple[int, str]] = {}
         for key, value in source.items():
             if isinstance(value, tuple):
                 label_id, canonical = value
             else:
                 label_id = value
                 canonical = key
-            processed[key.lower()] = (label_id, canonical)
+            norm_key = self._normalize(key)
+            processed[norm_key] = (label_id, canonical)
+            tokens = tuple(sorted(norm_key.split()))
+            if tokens and tokens not in token_map:
+                token_map[tokens] = (label_id, canonical)
         self._mapping = processed
+        self._token_mapping = token_map
 
     def encode(self, value: str) -> Tuple[int, str]:
-        key = value.strip().lower()
+        key = self._normalize(value.strip())
         if not key:
             raise ValueError("Cannot encode an empty annotation value")
 
@@ -102,6 +119,12 @@ class ValueLabelEncoder:
             situ = self._mapping.get("in situ carcinoma")
             if situ is not None:
                 return situ
+
+        tokens = tuple(sorted(key.split()))
+        if tokens:
+            match = self._token_mapping.get(tokens)
+            if match is not None:
+                return match
 
         for candidate_key, encoded in self._mapping.items():
             if candidate_key in key or key in candidate_key:
