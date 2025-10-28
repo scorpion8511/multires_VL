@@ -71,6 +71,7 @@ class ValueLabelEncoder:
         "benign": 1,
         "in situ carcinoma": 2,
         "invasive carcinoma": 3,
+        "carcinoma in situ": 2,
     }
 
     def __init__(self, mapping: Optional[Dict[str, int]] = None) -> None:
@@ -570,13 +571,12 @@ def process_wsi(
         if bag:
             bag_node, tiles = bag
             bags.append(bag_node)
-            region_value = (
-                selected_region.value.strip()
-                if selected_region and selected_region.value
-                else ""
-            )
+            if selected_region and selected_region.value:
+                region_value = selected_region.value.strip() or "Normal"
+            else:
+                region_value = "Normal"
             label_str = ""
-            if region_value and label_encoder is not None:
+            if label_encoder is not None:
                 try:
                     label_id = label_encoder.encode(region_value)
                 except (KeyError, ValueError) as exc:
