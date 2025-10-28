@@ -260,6 +260,14 @@ def parse_aperio_xml(xml_path: Path) -> List[AnnotationRegion]:
                         break
                     if value is None:
                         value = attr_value
+
+            if value is None:
+                text_value = region.get("Text") or region.get("text")
+                if text_value:
+                    text_value = text_value.strip()
+                    if text_value:
+                        value = text_value
+
             polygons.append(AnnotationRegion(points=points, value=value))
     return polygons
 
