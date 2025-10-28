@@ -45,6 +45,37 @@ from PIL import Image
 import numpy as np
 
 
+@dataclass
+class AnnotationRegion:
+    """Polygonal region extracted from an Aperio XML annotation."""
+
+    points: List[Tuple[float, float]]
+    value: Optional[str] = None
+
+
+@dataclass
+class PatchTile:
+    """Metadata describing a saved patch tile."""
+
+    patch_id: str
+    patch_file: str
+    patch_path: Path
+    scale_suffix: str
+
+
+class ValueLabelEncoder:
+    """Assign deterministic integer labels to string values."""
+
+    def __init__(self) -> None:
+        self._mapping: Dict[str, int] = {}
+
+    def encode(self, value: str) -> int:
+        key = value.strip()
+        if key not in self._mapping:
+            self._mapping[key] = len(self._mapping)
+        return self._mapping[key]
+
+
 def polygon_area(points: Sequence[Tuple[float, float]]) -> float:
     """Return the absolute area of a polygon described by ``points``."""
 
@@ -93,14 +124,15 @@ class PolygonSampler:
 
     def __init__(
         self,
-        polygons: Sequence[Sequence[Tuple[float, float]]],
+        polygons: Sequence[AnnotationRegion],
         margin: float,
         slide_width: int,
         slide_height: int,
     ) -> None:
         self._margin = margin
         entries = []
-        for poly in polygons:
+        for region in polygons:
+            poly = region.points
             if len(poly) < 3:
                 continue
             xs = [p[0] for p in poly]
@@ -119,6 +151,7 @@ class PolygonSampler:
                     "polygon": list(poly),
                     "area": area,
                     "bounds": (min_x, max_x, min_y, max_y),
+                    "region": region,
                 }
             )
         self._entries = entries
@@ -127,7 +160,9 @@ class PolygonSampler:
     def is_available(self) -> bool:
         return bool(self._entries)
 
-    def sample(self, max_attempts: int = 2000) -> Optional[Tuple[int, int]]:
+    def sample(
+        self, max_attempts: int = 2000
+    ) -> Optional[Tuple[int, int, AnnotationRegion]]:
         if not self._entries:
             return None
         for _ in range(max_attempts):
@@ -142,12 +177,12 @@ class PolygonSampler:
                 continue
             if not _corners_inside(x, y, self._margin, polygon):
                 continue
-            return int(round(x)), int(round(y))
+            return int(round(x)), int(round(y)), entry["region"]
         return None
 
 
-def parse_aperio_xml(xml_path: Path) -> List[List[Tuple[float, float]]]:
-    """Parse an Aperio annotation XML file into polygons."""
+def parse_aperio_xml(xml_path: Path) -> List[AnnotationRegion]:
+    """Parse an Aperio annotation XML file into annotated regions."""
 
     try:
         tree = ET.parse(xml_path)
@@ -156,7 +191,7 @@ def parse_aperio_xml(xml_path: Path) -> List[List[Tuple[float, float]]]:
         return []
 
     root = tree.getroot()
-    polygons: List[List[Tuple[float, float]]] = []
+    polygons: List[AnnotationRegion] = []
     for region in root.findall(".//Region"):
         vertices = region.find("Vertices")
         if vertices is None:
@@ -172,7 +207,16 @@ def parse_aperio_xml(xml_path: Path) -> List[List[Tuple[float, float]]]:
             except ValueError:
                 continue
         if len(points) >= 3:
-            polygons.append(points)
+            value: Optional[str] = None
+            attributes = region.find("Attributes")
+            if attributes is not None:
+                for attribute in attributes.findall("Attribute"):
+                    name = attribute.get("Name") or attribute.get("name")
+                    attr_value = attribute.get("Value") or attribute.get("value")
+                    if name and name.lower() == "value" and attr_value is not None:
+                        value = attr_value.strip()
+                        break
+            polygons.append(AnnotationRegion(points=points, value=value))
     return polygons
 
 
@@ -232,7 +276,7 @@ def load_slide_polygons(
     slide_path: Path,
     annotation_root: Optional[Path],
     annotation_lookup: Optional[Dict[str, List[Path]]] = None,
-) -> List[List[Tuple[float, float]]]:
+) -> List[AnnotationRegion]:
     """Return polygons for ``slide_path`` if an annotation XML is available."""
 
     candidates: List[Path] = []
@@ -354,7 +398,7 @@ def generate_hierarchy(
     size: int = 512,
     tissue_threshold: float = 0.75,
     background_threshold: int = 220,
-) -> Optional[Dict[str, object]]:
+) -> Optional[Tuple[Dict[str, object], List[PatchTile]]]:
     """Generate a chain of patches centered at ``(center_x, center_y)``.
 
     The first entry in ``mpps`` corresponds to the coarsest magnification
@@ -386,6 +430,12 @@ def generate_hierarchy(
     if saved_path is None:
         return None
 
+    tile = PatchTile(
+        patch_id=patch_id,
+        patch_file=out_path.name,
+        patch_path=saved_path,
+        scale_suffix=suffix,
+    )
     node: Dict[str, object] = {"id": patch_id, "file": out_path.name, "children": []}
     if len(mpps) > 1:
         child = generate_hierarchy(
@@ -406,8 +456,19 @@ def generate_hierarchy(
             except FileNotFoundError:
                 pass
             return None
-        node["children"].append(child)
-    return node
+        child_node, child_tiles = child
+        node["children"].append(child_node)
+        tiles = [tile] + child_tiles
+    else:
+        tiles = [tile]
+    return node, tiles
+
+
+def _generate_patient_id(slide_path: Path) -> str:
+    """Return a deterministic pseudo-random identifier for ``slide_path``."""
+
+    seed = abs(hash(slide_path.stem.lower())) % 10**12
+    return f"{seed:012d}"
 
 
 def process_wsi(
@@ -417,8 +478,9 @@ def process_wsi(
     seed: int = 0,
     tissue_threshold: float = 0.75,
     background_threshold: int = 220,
-    polygons: Optional[List[List[Tuple[float, float]]]] = None,
-) -> int:
+    polygons: Optional[List[AnnotationRegion]] = None,
+    label_encoder: Optional[ValueLabelEncoder] = None,
+) -> Tuple[int, List[Dict[str, str]]]:
     """Process a single WSI and generate multi-scale patch bags.
 
     Returns the number of patch bags successfully collected.
@@ -452,6 +514,8 @@ def process_wsi(
             sampler = None
 
     bags = []
+    patch_rows: List[Dict[str, str]] = []
+    patient_id = _generate_patient_id(slide_path)
     i = 0
     attempts = 0
     max_attempts = num_parents * 20 if num_parents > 0 else 0
@@ -465,10 +529,11 @@ def process_wsi(
                     f"annotations for {slide_path.name}."
                 )
                 break
-            center_x, center_y = candidate
+            center_x, center_y, selected_region = candidate
         else:
             center_x = random.randint(margin_int, max_cx)
             center_y = random.randint(margin_int, max_cy)
+            selected_region = None
         prefix = f"patch_{i}"
         bag = generate_hierarchy(
             slide,
@@ -483,7 +548,30 @@ def process_wsi(
             background_threshold,
         )
         if bag:
-            bags.append(bag)
+            bag_node, tiles = bag
+            bags.append(bag_node)
+            region_value = selected_region.value.strip() if selected_region and selected_region.value else ""
+            if region_value and label_encoder is not None:
+                label_id = label_encoder.encode(region_value)
+                label_str = str(label_id)
+            else:
+                label_str = ""
+            for tile in tiles:
+                patch_rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "pathology_id": slide_path.name,
+                        "subtype": region_value,
+                        "labels": label_str,
+                        "resolved_path": str(slide_path),
+                        "slide_stem": slide_path.stem,
+                        "bag_index": str(i),
+                        "patch_id": tile.patch_id,
+                        "patch_file": tile.patch_file,
+                        "patch_path": str(tile.patch_path),
+                        "patch_scale": tile.scale_suffix,
+                    }
+                )
             i += 1
 
     if i < num_parents:
@@ -491,13 +579,14 @@ def process_wsi(
             f"Warning: only collected {i} patch bags (requested {num_parents}) "
             f"for {slide_path.name}."
         )
+        patch_rows = []
 
     with open(out_dir / "bags.json", "w") as f:
         json.dump(bags, f, indent=2)
 
     slide.close()
 
-    return len(bags)
+    return len(bags), patch_rows
 
 
 def gather_slides(wsi_root: Path) -> List[Path]:
@@ -722,6 +811,8 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     annotation_root = resolve_annotation_root(args.annotation_dir)
     annotation_lookup = index_annotation_files(annotation_root)
+    label_encoder = ValueLabelEncoder()
+    all_patch_rows: List[Dict[str, str]] = []
 
     if args.metadata_csv is not None:
         metadata_rows, fieldnames = load_metadata_table(args.metadata_csv)
@@ -747,7 +838,7 @@ def main() -> None:
                 annotation_root,
                 annotation_lookup,
             )
-            bags_collected = process_wsi(
+            bag_count, patch_rows = process_wsi(
                 slide_path,
                 args.out_dir,
                 num_parents=args.num_parents,
@@ -755,8 +846,9 @@ def main() -> None:
                 tissue_threshold=args.tissue_threshold,
                 background_threshold=args.background_threshold,
                 polygons=annotation_polygons,
+                label_encoder=label_encoder,
             )
-            if bags_collected < args.num_parents:
+            if bag_count < args.num_parents:
                 slide_out_dir = args.out_dir / slide_path.stem
                 if slide_out_dir.exists():
                     shutil.rmtree(slide_out_dir, ignore_errors=True)
@@ -764,12 +856,13 @@ def main() -> None:
                 print(
                     f"Scheduling an additional slide for subtype '{subtype}' "
                     f"because {slide_path.name} ({reason}) yielded "
-                    f"{bags_collected} patch bags."
+                    f"{bag_count} patch bags."
                 )
                 return False
 
             counts[subtype] += 1
             accepted_pairs.append(pair)
+            all_patch_rows.extend(patch_rows)
             return True
 
         for pair in selection.initial:
@@ -825,7 +918,7 @@ def main() -> None:
                 annotation_root,
                 annotation_lookup,
             )
-            process_wsi(
+            bag_count, patch_rows = process_wsi(
                 slide_path,
                 args.out_dir,
                 num_parents=args.num_parents,
@@ -833,7 +926,31 @@ def main() -> None:
                 tissue_threshold=args.tissue_threshold,
                 background_threshold=args.background_threshold,
                 polygons=annotation_polygons,
+                label_encoder=label_encoder,
             )
+            if bag_count >= args.num_parents or args.num_parents == 0:
+                all_patch_rows.extend(patch_rows)
+
+    if all_patch_rows:
+        patch_csv_path = args.out_dir / "patches.csv"
+        fieldnames = [
+            "patient_id",
+            "pathology_id",
+            "subtype",
+            "labels",
+            "resolved_path",
+            "slide_stem",
+            "bag_index",
+            "patch_id",
+            "patch_file",
+            "patch_path",
+            "patch_scale",
+        ]
+        with patch_csv_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in all_patch_rows:
+                writer.writerow(row)
 
 
 if __name__ == "__main__":
