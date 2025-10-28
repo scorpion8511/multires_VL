@@ -67,18 +67,28 @@ class ValueLabelEncoder:
     """Assign deterministic integer labels to known annotation values."""
 
     DEFAULT_MAPPING = {
-        "normal": 0,
-        "benign": 1,
-        "in situ carcinoma": 2,
-        "invasive carcinoma": 3,
-        "carcinoma in situ": 2,
+        "normal": (0, "Normal"),
+        "benign": (1, "Benign"),
+        "in situ carcinoma": (2, "in situ carcinoma"),
+        "carcinoma in situ": (2, "in situ carcinoma"),
+        "invasive carcinoma": (3, "Invasive carcinoma"),
     }
 
-    def __init__(self, mapping: Optional[Dict[str, int]] = None) -> None:
+    def __init__(
+        self, mapping: Optional[Dict[str, Tuple[int, str] | int]] = None
+    ) -> None:
         source = mapping or self.DEFAULT_MAPPING
-        self._mapping: Dict[str, int] = {k.lower(): v for k, v in source.items()}
+        processed: Dict[str, Tuple[int, str]] = {}
+        for key, value in source.items():
+            if isinstance(value, tuple):
+                label_id, canonical = value
+            else:
+                label_id = value
+                canonical = key
+            processed[key.lower()] = (label_id, canonical)
+        self._mapping = processed
 
-    def encode(self, value: str) -> int:
+    def encode(self, value: str) -> Tuple[int, str]:
         key = value.strip().lower()
         if not key:
             raise ValueError("Cannot encode an empty annotation value")
@@ -578,7 +588,7 @@ def process_wsi(
             label_str = ""
             if label_encoder is not None:
                 try:
-                    label_id = label_encoder.encode(region_value)
+                    label_id, canonical_value = label_encoder.encode(region_value)
                 except (KeyError, ValueError) as exc:
                     print(
                         "Warning:",
@@ -589,6 +599,7 @@ def process_wsi(
                     )
                 else:
                     label_str = str(label_id)
+                    region_value = canonical_value
             for tile in tiles:
                 patch_rows.append(
                     {
