@@ -92,12 +92,24 @@ class ValueLabelEncoder:
         key = value.strip().lower()
         if not key:
             raise ValueError("Cannot encode an empty annotation value")
-        if key not in self._mapping:
-            raise KeyError(
-                f"Annotation value '{value}' does not match any known subtype "
-                f"labels ({', '.join(sorted(self._mapping))})."
-            )
-        return self._mapping[key]
+
+        direct = self._mapping.get(key)
+        if direct is not None:
+            return direct
+
+        if "situ" in key:
+            situ = self._mapping.get("in situ carcinoma")
+            if situ is not None:
+                return situ
+
+        for candidate_key, encoded in self._mapping.items():
+            if candidate_key in key or key in candidate_key:
+                return encoded
+
+        raise KeyError(
+            f"Annotation value '{value}' does not match any known subtype "
+            f"labels ({', '.join(sorted(self._mapping))})."
+        )
 
 
 def polygon_area(points: Sequence[Tuple[float, float]]) -> float:
