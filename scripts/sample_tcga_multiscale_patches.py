@@ -6,7 +6,10 @@ paper referenced as ``2504.18856v1``.
 
 For each WSI slide, the script randomly selects 20 seed locations.  At
 each location a hierarchy of patches is extracted that all share the
-same center but differ in magnification:
+same center but differ in magnification.  When Aperio XML annotations
+are provided via ``--annotation-dir``, seed locations are sampled only
+inside the annotated polygons so that all patches fall within the
+specified tissue region:
 
 * 5×  (2   µm/px)
 * 10× (1   µm/px)
@@ -34,11 +37,210 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import unquote, urlparse
+import xml.etree.ElementTree as ET
 
 import openslide
 from PIL import Image
 import numpy as np
 
+
+def polygon_area(points: Sequence[Tuple[float, float]]) -> float:
+    """Return the absolute area of a polygon described by ``points``."""
+
+    area = 0.0
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        area += x0 * y1 - x1 * y0
+    if points:
+        x0, y0 = points[-1]
+        x1, y1 = points[0]
+        area += x0 * y1 - x1 * y0
+    return abs(area) * 0.5
+
+
+def point_in_polygon(x: float, y: float, polygon: Sequence[Tuple[float, float]]) -> bool:
+    """Return ``True`` if ``(x, y)`` lies inside ``polygon`` using ray casting."""
+
+    inside = False
+    n = len(polygon)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > y) != (yj > y)):
+            slope = (xj - xi) / (yj - yi) if (yj - yi) != 0 else float("inf")
+            x_intersect = slope * (y - yi) + xi if slope != float("inf") else xi
+            if x < x_intersect:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _corners_inside(
+    x: float, y: float, margin: float, polygon: Sequence[Tuple[float, float]]
+) -> bool:
+    offsets = [(-margin, -margin), (-margin, margin), (margin, -margin), (margin, margin)]
+    for dx, dy in offsets:
+        if not point_in_polygon(x + dx, y + dy, polygon):
+            return False
+    return True
+
+
+class PolygonSampler:
+    """Randomly sample centers constrained to annotation polygons."""
+
+    def __init__(
+        self,
+        polygons: Sequence[Sequence[Tuple[float, float]]],
+        margin: float,
+        slide_width: int,
+        slide_height: int,
+    ) -> None:
+        self._margin = margin
+        entries = []
+        for poly in polygons:
+            if len(poly) < 3:
+                continue
+            xs = [p[0] for p in poly]
+            ys = [p[1] for p in poly]
+            min_x = max(min(xs) + margin, margin)
+            max_x = min(max(xs) - margin, slide_width - margin)
+            min_y = max(min(ys) + margin, margin)
+            max_y = min(max(ys) - margin, slide_height - margin)
+            if min_x >= max_x or min_y >= max_y:
+                continue
+            area = polygon_area(poly)
+            if area <= 0:
+                continue
+            entries.append(
+                {
+                    "polygon": list(poly),
+                    "area": area,
+                    "bounds": (min_x, max_x, min_y, max_y),
+                }
+            )
+        self._entries = entries
+        self._weights = [entry["area"] for entry in entries]
+
+    def is_available(self) -> bool:
+        return bool(self._entries)
+
+    def sample(self, max_attempts: int = 2000) -> Optional[Tuple[int, int]]:
+        if not self._entries:
+            return None
+        for _ in range(max_attempts):
+            entry = random.choices(self._entries, weights=self._weights, k=1)[0]
+            min_x, max_x, min_y, max_y = entry["bounds"]
+            if min_x >= max_x or min_y >= max_y:
+                continue
+            x = random.uniform(min_x, max_x)
+            y = random.uniform(min_y, max_y)
+            polygon = entry["polygon"]
+            if not point_in_polygon(x, y, polygon):
+                continue
+            if not _corners_inside(x, y, self._margin, polygon):
+                continue
+            return int(round(x)), int(round(y))
+        return None
+
+
+def parse_aperio_xml(xml_path: Path) -> List[List[Tuple[float, float]]]:
+    """Parse an Aperio annotation XML file into polygons."""
+
+    try:
+        tree = ET.parse(xml_path)
+    except ET.ParseError as exc:
+        print(f"Warning: failed to parse annotation file {xml_path}: {exc}")
+        return []
+
+    root = tree.getroot()
+    polygons: List[List[Tuple[float, float]]] = []
+    for region in root.findall(".//Region"):
+        vertices = region.find("Vertices")
+        if vertices is None:
+            continue
+        points: List[Tuple[float, float]] = []
+        for vertex in vertices.findall("Vertex"):
+            x_val = vertex.get("X")
+            y_val = vertex.get("Y")
+            if x_val is None or y_val is None:
+                continue
+            try:
+                points.append((float(x_val), float(y_val)))
+            except ValueError:
+                continue
+        if len(points) >= 3:
+            polygons.append(points)
+    return polygons
+
+
+def _unique_paths(paths: Sequence[Path]) -> List[Path]:
+    seen = set()
+    unique: List[Path] = []
+    for path in paths:
+        if not path:
+            continue
+        key = path.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def load_slide_polygons(
+    slide_path: Path,
+    annotation_root: Optional[Path],
+) -> List[List[Tuple[float, float]]]:
+    """Return polygons for ``slide_path`` if an annotation XML is available."""
+
+    candidates: List[Path] = []
+    if annotation_root is not None:
+        if annotation_root.is_file():
+            candidates.append(annotation_root)
+        elif annotation_root.is_dir():
+            candidates.extend(
+                [
+                    annotation_root / f"{slide_path.stem}.xml",
+                    annotation_root / f"{slide_path.name}.xml",
+                    annotation_root / f"{slide_path.stem.upper()}.xml",
+                    annotation_root / f"{slide_path.stem.lower()}.xml",
+                ]
+            )
+    candidates.append(slide_path.with_suffix(".xml"))
+
+    for candidate in _unique_paths(candidates):
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        polygons = parse_aperio_xml(candidate)
+        if polygons:
+            return polygons
+        else:
+            print(
+                f"Warning: annotation file {candidate} does not contain "
+                "any polygon regions."
+            )
+    return []
+
+
+def resolve_annotation_root(annotation_root: Optional[Path]) -> Optional[Path]:
+    """Normalize ``annotation_root`` and resolve file:// URIs if necessary."""
+
+    if annotation_root is None:
+        return None
+
+    raw = str(annotation_root)
+    if raw.startswith("file:"):
+        parsed = urlparse(raw)
+        if parsed.scheme == "file":
+            decoded = unquote(parsed.path)
+            if decoded:
+                if decoded.startswith("/") and len(decoded) > 2 and decoded[2] == ":":
+                    decoded = decoded.lstrip("/")
+                return Path(decoded)
+    return annotation_root
 
 def compute_tissue_fraction(img: Image.Image, background_threshold: int = 220) -> float:
     """Return the fraction of pixels that are likely to be tissue.
@@ -155,6 +357,7 @@ def process_wsi(
     seed: int = 0,
     tissue_threshold: float = 0.75,
     background_threshold: int = 220,
+    polygons: Optional[List[List[Tuple[float, float]]]] = None,
 ) -> int:
     """Process a single WSI and generate multi-scale patch bags.
 
@@ -173,9 +376,20 @@ def process_wsi(
 
     # Compute bounds for sampling centers so that all magnifications fit
     parent_ds = target_mpps[0] / base_mpp
-    margin = int(size * parent_ds / 2)
-    max_cx = slide_width - margin
-    max_cy = slide_height - margin
+    margin = size * parent_ds / 2
+    margin_int = int(margin)
+    max_cx = slide_width - margin_int
+    max_cy = slide_height - margin_int
+
+    sampler: Optional[PolygonSampler] = None
+    if polygons:
+        sampler = PolygonSampler(polygons, margin, slide_width, slide_height)
+        if not sampler.is_available():
+            print(
+                "Warning: annotation polygons for "
+                f"{slide_path.name} are too small for sampling."
+            )
+            sampler = None
 
     bags = []
     i = 0
@@ -183,8 +397,18 @@ def process_wsi(
     max_attempts = num_parents * 20 if num_parents > 0 else 0
     while i < num_parents and (max_attempts == 0 or attempts < max_attempts):
         attempts += 1
-        center_x = random.randint(margin, max_cx)
-        center_y = random.randint(margin, max_cy)
+        if sampler is not None:
+            candidate = sampler.sample()
+            if candidate is None:
+                print(
+                    "Warning: unable to find more valid centers inside "
+                    f"annotations for {slide_path.name}."
+                )
+                break
+            center_x, center_y = candidate
+        else:
+            center_x = random.randint(margin_int, max_cx)
+            center_y = random.randint(margin_int, max_cy)
         prefix = f"patch_{i}"
         bag = generate_hierarchy(
             slide,
@@ -415,6 +639,14 @@ def main() -> None:
         help="Column in the metadata CSV that stores slide file names",
     )
     parser.add_argument(
+        "--annotation-dir",
+        type=Path,
+        help=(
+            "Directory or file containing Aperio-style XML annotations. "
+            "If provided, patches are sampled only from annotated regions."
+        ),
+    )
+    parser.add_argument(
         "--num-wsi",
         type=int,
         default=50,
@@ -428,6 +660,7 @@ def main() -> None:
         raise FileNotFoundError(f"No WSI files found at {args.wsi_dir}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    annotation_root = resolve_annotation_root(args.annotation_dir)
 
     if args.metadata_csv is not None:
         metadata_rows, fieldnames = load_metadata_table(args.metadata_csv)
@@ -448,6 +681,10 @@ def main() -> None:
             slide_path, row = pair
             subtype = row[args.metadata_subtype_column]
             print(f"Processing {slide_path}")
+            annotation_polygons = load_slide_polygons(
+                slide_path,
+                annotation_root,
+            )
             bags_collected = process_wsi(
                 slide_path,
                 args.out_dir,
@@ -455,6 +692,7 @@ def main() -> None:
                 seed=args.seed,
                 tissue_threshold=args.tissue_threshold,
                 background_threshold=args.background_threshold,
+                polygons=annotation_polygons,
             )
             if bags_collected < args.num_parents:
                 slide_out_dir = args.out_dir / slide_path.stem
@@ -520,6 +758,10 @@ def main() -> None:
     else:
         for slide_path in slides:
             print(f"Processing {slide_path}")
+            annotation_polygons = load_slide_polygons(
+                slide_path,
+                annotation_root,
+            )
             process_wsi(
                 slide_path,
                 args.out_dir,
@@ -527,6 +769,7 @@ def main() -> None:
                 seed=args.seed,
                 tissue_threshold=args.tissue_threshold,
                 background_threshold=args.background_threshold,
+                polygons=annotation_polygons,
             )
 
 
