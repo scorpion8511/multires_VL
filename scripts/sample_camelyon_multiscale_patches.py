@@ -41,6 +41,111 @@ from sample_tcga_multiscale_patches import (
 )
 
 
+def _extract_group_metadata(root: ET.Element) -> Dict[str, Dict[str, object]]:
+    """Return descriptive metadata for ``Group`` elements keyed by their name."""
+
+    def _clean(text: Optional[str]) -> Optional[str]:
+        if text is None:
+            return None
+        stripped = text.strip()
+        return stripped if stripped else None
+
+    group_lookup: Dict[str, Dict[str, object]] = {}
+    for group in root.findall(".//Group"):
+        raw_name = _clean(group.get("Name") or group.get("name"))
+        if not raw_name:
+            continue
+        lower_name = raw_name.lower()
+        labels: List[str] = []
+
+        attr_parent = group.find("Attributes")
+        if attr_parent is not None:
+            for attribute in attr_parent.findall("Attribute"):
+                attr_value = _clean(attribute.get("Value") or attribute.get("value"))
+                attr_name = _clean(attribute.get("Name") or attribute.get("name"))
+                if attr_value:
+                    labels.append(attr_value)
+                elif attr_name:
+                    labels.append(attr_name)
+
+        if not labels:
+            labels.append(raw_name)
+
+        tumor_like = any(
+            token in label.lower()
+            for label in labels
+            for token in ("tumor", "metast", "positive")
+        )
+        negative_like = any(
+            token in label.lower()
+            for label in labels
+            for token in ("normal", "negative", "exclusion", "exclude")
+        )
+
+        group_lookup[lower_name] = {
+            "labels": labels,
+            "is_tumor": tumor_like and not negative_like,
+            "is_negative": negative_like and not tumor_like,
+        }
+
+    return group_lookup
+
+
+def _annotation_is_tumor(
+    annotation: ET.Element,
+    group_lookup: Dict[str, Dict[str, object]],
+) -> bool:
+    """Heuristically determine if an annotation polygon marks tumor tissue."""
+
+    def _clean(text: Optional[str]) -> Optional[str]:
+        if text is None:
+            return None
+        stripped = text.strip()
+        return stripped if stripped else None
+
+    def _classify(text: str) -> Optional[bool]:
+        lower = text.lower()
+        if any(token in lower for token in ("tumor", "metast", "positive")):
+            return True
+        if any(token in lower for token in ("normal", "negative", "exclusion", "exclude")):
+            return False
+        return None
+
+    candidates: List[str] = []
+    part_of_group = _clean(annotation.get("PartOfGroup") or annotation.get("partOfGroup"))
+    if part_of_group:
+        candidates.append(part_of_group)
+        group = group_lookup.get(part_of_group.lower())
+        if group:
+            candidates.extend(group.get("labels", []))
+            if group.get("is_tumor"):
+                return True
+            if group.get("is_negative"):
+                return False
+
+    name_attr = _clean(annotation.get("Name") or annotation.get("name"))
+    if name_attr:
+        candidates.append(name_attr)
+
+    attr_parent = annotation.find("Attributes")
+    if attr_parent is not None:
+        for attribute in attr_parent.findall("Attribute"):
+            attr_value = _clean(attribute.get("Value") or attribute.get("value"))
+            attr_name = _clean(attribute.get("Name") or attribute.get("name"))
+            if attr_value:
+                candidates.append(attr_value)
+            if attr_name:
+                candidates.append(attr_name)
+
+    for candidate in candidates:
+        classification = _classify(candidate)
+        if classification is not None:
+            return classification
+
+    # Default to tumor: Camelyon annotations typically describe tumor regions.
+    return True
+
+
 def parse_camelyon_xml(xml_path: Path) -> List[AnnotationRegion]:
     """Parse tumor polygons from a Camelyon XML annotation file."""
 
@@ -52,16 +157,13 @@ def parse_camelyon_xml(xml_path: Path) -> List[AnnotationRegion]:
     root = tree.getroot()
 
     polygons: List[AnnotationRegion] = []
+    group_lookup = _extract_group_metadata(root)
     for annotation in root.findall(".//Annotation"):
         type_attr = (annotation.get("Type") or annotation.get("type") or "").lower()
         if type_attr and type_attr != "polygon":
             continue
 
-        part_of_group = (annotation.get("PartOfGroup") or annotation.get("partOfGroup") or "").lower()
-        name_attr = (annotation.get("Name") or annotation.get("name") or "").lower()
-        if part_of_group and "tumor" not in part_of_group:
-            continue
-        if not part_of_group and name_attr and "tumor" not in name_attr:
+        if not _annotation_is_tumor(annotation, group_lookup):
             continue
 
         coordinates_parent = annotation.find(".//Coordinates")
