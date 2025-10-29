@@ -6,7 +6,10 @@ paper referenced as ``2504.18856v1``.
 
 For each WSI slide, the script randomly selects 20 seed locations.  At
 each location a hierarchy of patches is extracted that all share the
-same center but differ in magnification:
+same center but differ in magnification.  When Aperio XML annotations
+are provided via ``--annotation-dir``, seed locations are sampled only
+inside the annotated polygons so that all patches fall within the
+specified tissue region:
 
 * 5×  (2   µm/px)
 * 10× (1   µm/px)
@@ -34,11 +37,389 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import unquote, urlparse
+import xml.etree.ElementTree as ET
 
 import openslide
 from PIL import Image
 import numpy as np
 
+
+@dataclass
+class AnnotationRegion:
+    """Polygonal region extracted from an Aperio XML annotation."""
+
+    points: List[Tuple[float, float]]
+    value: Optional[str] = None
+
+
+@dataclass
+class PatchTile:
+    """Metadata describing a saved patch tile."""
+
+    patch_id: str
+    patch_file: str
+    patch_path: Path
+    scale_suffix: str
+
+
+class ValueLabelEncoder:
+    """Assign deterministic integer labels to known annotation values."""
+
+    DEFAULT_MAPPING = {
+        "normal": (0, "Normal"),
+        "benign": (1, "Benign"),
+        "in situ carcinoma": (2, "In situ carcinoma"),
+        "carcinoma in situ": (2, "In situ carcinoma"),
+        "carcinoma in-situ": (2, "In situ carcinoma"),
+        "in-situ carcinoma": (2, "In situ carcinoma"),
+        "in situ": (2, "In situ carcinoma"),
+        "situ": (2, "In situ carcinoma"),
+        "carcinoma situ": (2, "In situ carcinoma"),
+        "invasive carcinoma": (3, "Invasive carcinoma"),
+        "carcinoma invasive": (3, "Invasive carcinoma"),
+    }
+
+    @staticmethod
+    def _normalize(value: str) -> str:
+        normalized = value.lower().replace("-", " ")
+        normalized = " ".join(normalized.split())
+        return normalized
+
+    def __init__(
+        self, mapping: Optional[Dict[str, Tuple[int, str] | int]] = None
+    ) -> None:
+        source = mapping or self.DEFAULT_MAPPING
+        processed: Dict[str, Tuple[int, str]] = {}
+        token_map: Dict[Tuple[str, ...], Tuple[int, str]] = {}
+        for key, value in source.items():
+            if isinstance(value, tuple):
+                label_id, canonical = value
+            else:
+                label_id = value
+                canonical = key
+            norm_key = self._normalize(key)
+            processed[norm_key] = (label_id, canonical)
+            tokens = tuple(sorted(norm_key.split()))
+            if tokens and tokens not in token_map:
+                token_map[tokens] = (label_id, canonical)
+        self._mapping = processed
+        self._token_mapping = token_map
+
+    def encode(self, value: str) -> Tuple[int, str]:
+        key = self._normalize(value.strip())
+        if not key:
+            raise ValueError("Cannot encode an empty annotation value")
+
+        direct = self._mapping.get(key)
+        if direct is not None:
+            return direct
+
+        if "situ" in key:
+            situ = self._mapping.get("in situ carcinoma")
+            if situ is not None:
+                return situ
+
+        tokens = tuple(sorted(key.split()))
+        if tokens:
+            match = self._token_mapping.get(tokens)
+            if match is not None:
+                return match
+
+        for candidate_key, encoded in self._mapping.items():
+            if candidate_key in key or key in candidate_key:
+                return encoded
+
+        raise KeyError(
+            f"Annotation value '{value}' does not match any known subtype "
+            f"labels ({', '.join(sorted(self._mapping))})."
+        )
+
+
+def polygon_area(points: Sequence[Tuple[float, float]]) -> float:
+    """Return the absolute area of a polygon described by ``points``."""
+
+    area = 0.0
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        area += x0 * y1 - x1 * y0
+    if points:
+        x0, y0 = points[-1]
+        x1, y1 = points[0]
+        area += x0 * y1 - x1 * y0
+    return abs(area) * 0.5
+
+
+def point_in_polygon(x: float, y: float, polygon: Sequence[Tuple[float, float]]) -> bool:
+    """Return ``True`` if ``(x, y)`` lies inside ``polygon`` using ray casting."""
+
+    inside = False
+    n = len(polygon)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > y) != (yj > y)):
+            slope = (xj - xi) / (yj - yi) if (yj - yi) != 0 else float("inf")
+            x_intersect = slope * (y - yi) + xi if slope != float("inf") else xi
+            if x < x_intersect:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _corners_inside(
+    x: float, y: float, margin: float, polygon: Sequence[Tuple[float, float]]
+) -> bool:
+    offsets = [(-margin, -margin), (-margin, margin), (margin, -margin), (margin, margin)]
+    for dx, dy in offsets:
+        if not point_in_polygon(x + dx, y + dy, polygon):
+            return False
+    return True
+
+
+class PolygonSampler:
+    """Randomly sample centers constrained to annotation polygons."""
+
+    def __init__(
+        self,
+        polygons: Sequence[AnnotationRegion],
+        margin: float,
+        slide_width: int,
+        slide_height: int,
+    ) -> None:
+        self._margin = margin
+        entries = []
+        for region in polygons:
+            poly = region.points
+            if len(poly) < 3:
+                continue
+            xs = [p[0] for p in poly]
+            ys = [p[1] for p in poly]
+            min_x = max(min(xs) + margin, margin)
+            max_x = min(max(xs) - margin, slide_width - margin)
+            min_y = max(min(ys) + margin, margin)
+            max_y = min(max(ys) - margin, slide_height - margin)
+            if min_x >= max_x or min_y >= max_y:
+                continue
+            area = polygon_area(poly)
+            if area <= 0:
+                continue
+            entries.append(
+                {
+                    "polygon": list(poly),
+                    "area": area,
+                    "bounds": (min_x, max_x, min_y, max_y),
+                    "region": region,
+                }
+            )
+        self._entries = entries
+        self._weights = [entry["area"] for entry in entries]
+
+    def is_available(self) -> bool:
+        return bool(self._entries)
+
+    def sample(
+        self, max_attempts: int = 2000
+    ) -> Optional[Tuple[int, int, AnnotationRegion]]:
+        if not self._entries:
+            return None
+        for _ in range(max_attempts):
+            entry = random.choices(self._entries, weights=self._weights, k=1)[0]
+            min_x, max_x, min_y, max_y = entry["bounds"]
+            if min_x >= max_x or min_y >= max_y:
+                continue
+            x = random.uniform(min_x, max_x)
+            y = random.uniform(min_y, max_y)
+            polygon = entry["polygon"]
+            if not point_in_polygon(x, y, polygon):
+                continue
+            if not _corners_inside(x, y, self._margin, polygon):
+                continue
+            return int(round(x)), int(round(y)), entry["region"]
+        return None
+
+
+def parse_aperio_xml(xml_path: Path) -> List[AnnotationRegion]:
+    """Parse an Aperio annotation XML file into annotated regions."""
+
+    try:
+        tree = ET.parse(xml_path)
+    except ET.ParseError as exc:
+        print(f"Warning: failed to parse annotation file {xml_path}: {exc}")
+        return []
+
+    root = tree.getroot()
+    polygons: List[AnnotationRegion] = []
+    for region in root.findall(".//Region"):
+        vertices = region.find("Vertices")
+        if vertices is None:
+            continue
+        points: List[Tuple[float, float]] = []
+        for vertex in vertices.findall("Vertex"):
+            x_val = vertex.get("X")
+            y_val = vertex.get("Y")
+            if x_val is None or y_val is None:
+                continue
+            try:
+                points.append((float(x_val), float(y_val)))
+            except ValueError:
+                continue
+        if len(points) >= 3:
+            value: Optional[str] = None
+            attributes = region.find("Attributes")
+            if attributes is not None:
+                for attribute in attributes.findall("Attribute"):
+                    name = attribute.get("Name") or attribute.get("name")
+                    attr_value = attribute.get("Value") or attribute.get("value")
+                    if attr_value is None:
+                        continue
+                    attr_value = attr_value.strip()
+                    if not attr_value:
+                        continue
+                    if name and name.lower() == "value":
+                        value = attr_value
+                        break
+                    if value is None:
+                        value = attr_value
+
+            if value is None:
+                text_value = region.get("Text") or region.get("text")
+                if text_value:
+                    text_value = text_value.strip()
+                    if text_value:
+                        value = text_value
+
+            polygons.append(AnnotationRegion(points=points, value=value))
+    return polygons
+
+
+def _unique_paths(paths: Sequence[Path]) -> List[Path]:
+    seen = set()
+    unique: List[Path] = []
+    for path in paths:
+        if not path:
+            continue
+        key = path.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def index_annotation_files(
+    annotation_root: Optional[Path],
+) -> Dict[str, List[Path]]:
+    """Return a lookup table for annotation XMLs keyed by lowercase names."""
+
+    lookup: Dict[str, List[Path]] = defaultdict(list)
+
+    def _register(key: str, path: Path) -> None:
+        entries = lookup[key]
+        if path in entries:
+            return
+        if entries:
+            print(
+                "Warning: multiple annotation files map to key '"
+                f"{key}' (including {entries[0]} and {path})."
+            )
+        entries.append(path)
+
+    if annotation_root is None:
+        return lookup
+
+    if annotation_root.is_file():
+        key_stem = annotation_root.stem.lower()
+        key_name = annotation_root.name.lower()
+        _register(key_stem, annotation_root)
+        _register(key_name, annotation_root)
+        return lookup
+
+    if annotation_root.is_dir():
+        for xml_path in annotation_root.rglob("*.xml"):
+            key_stem = xml_path.stem.lower()
+            key_name = xml_path.name.lower()
+            _register(key_stem, xml_path)
+            _register(key_name, xml_path)
+
+    return lookup
+
+
+def load_slide_polygons(
+    slide_path: Path,
+    annotation_root: Optional[Path],
+    annotation_lookup: Optional[Dict[str, List[Path]]] = None,
+) -> List[AnnotationRegion]:
+    """Return polygons for ``slide_path`` if an annotation XML is available."""
+
+    candidates: List[Path] = []
+    normalized_keys = {slide_path.stem.lower(), slide_path.name.lower()}
+
+    if annotation_lookup:
+        for key in normalized_keys:
+            candidates.extend(annotation_lookup.get(key, []))
+
+    if annotation_root is not None and not candidates:
+        if annotation_root.is_file():
+            candidates.append(annotation_root)
+        elif annotation_root.is_dir():
+            candidates.extend(
+                [
+                    annotation_root / f"{slide_path.stem}.xml",
+                    annotation_root / f"{slide_path.name}.xml",
+                    annotation_root / f"{slide_path.stem.upper()}.xml",
+                    annotation_root / f"{slide_path.stem.lower()}.xml",
+                ]
+            )
+
+    annotation_candidates = _unique_paths(candidates)
+    candidate_keys = {path.resolve() for path in annotation_candidates if path.exists()}
+
+    fallback_candidate = slide_path.with_suffix(".xml")
+    combined_candidates = annotation_candidates + [fallback_candidate]
+
+    matched_annotation = False
+    for candidate in _unique_paths(combined_candidates):
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        if candidate.resolve() in candidate_keys:
+            matched_annotation = True
+        polygons = parse_aperio_xml(candidate)
+        if polygons:
+            return polygons
+        else:
+            print(
+                f"Warning: annotation file {candidate} does not contain "
+                "any polygon regions."
+            )
+
+    if annotation_root is not None and annotation_candidates and not matched_annotation:
+        print(
+            "Warning: no matching annotation XML found for "
+            f"{slide_path.name} in {annotation_root}."
+        )
+
+    return []
+
+
+def resolve_annotation_root(annotation_root: Optional[Path]) -> Optional[Path]:
+    """Normalize ``annotation_root`` and resolve file:// URIs if necessary."""
+
+    if annotation_root is None:
+        return None
+
+    raw = str(annotation_root)
+    if raw.startswith("file:"):
+        parsed = urlparse(raw)
+        if parsed.scheme == "file":
+            decoded = unquote(parsed.path)
+            if decoded:
+                if decoded.startswith("/") and len(decoded) > 2 and decoded[2] == ":":
+                    decoded = decoded.lstrip("/")
+                return Path(decoded)
+    return annotation_root
 
 def compute_tissue_fraction(img: Image.Image, background_threshold: int = 220) -> float:
     """Return the fraction of pixels that are likely to be tissue.
@@ -92,7 +473,7 @@ def generate_hierarchy(
     size: int = 512,
     tissue_threshold: float = 0.75,
     background_threshold: int = 220,
-) -> Optional[Dict[str, object]]:
+) -> Optional[Tuple[Dict[str, object], List[PatchTile]]]:
     """Generate a chain of patches centered at ``(center_x, center_y)``.
 
     The first entry in ``mpps`` corresponds to the coarsest magnification
@@ -124,6 +505,12 @@ def generate_hierarchy(
     if saved_path is None:
         return None
 
+    tile = PatchTile(
+        patch_id=patch_id,
+        patch_file=out_path.name,
+        patch_path=saved_path,
+        scale_suffix=suffix,
+    )
     node: Dict[str, object] = {"id": patch_id, "file": out_path.name, "children": []}
     if len(mpps) > 1:
         child = generate_hierarchy(
@@ -144,8 +531,19 @@ def generate_hierarchy(
             except FileNotFoundError:
                 pass
             return None
-        node["children"].append(child)
-    return node
+        child_node, child_tiles = child
+        node["children"].append(child_node)
+        tiles = [tile] + child_tiles
+    else:
+        tiles = [tile]
+    return node, tiles
+
+
+def _generate_patient_id(slide_path: Path) -> str:
+    """Return a deterministic pseudo-random identifier for ``slide_path``."""
+
+    seed = abs(hash(slide_path.stem.lower())) % 10**12
+    return f"{seed:012d}"
 
 
 def process_wsi(
@@ -155,7 +553,9 @@ def process_wsi(
     seed: int = 0,
     tissue_threshold: float = 0.75,
     background_threshold: int = 220,
-) -> int:
+    polygons: Optional[List[AnnotationRegion]] = None,
+    label_encoder: Optional[ValueLabelEncoder] = None,
+) -> Tuple[int, List[Dict[str, str]]]:
     """Process a single WSI and generate multi-scale patch bags.
 
     Returns the number of patch bags successfully collected.
@@ -173,18 +573,42 @@ def process_wsi(
 
     # Compute bounds for sampling centers so that all magnifications fit
     parent_ds = target_mpps[0] / base_mpp
-    margin = int(size * parent_ds / 2)
-    max_cx = slide_width - margin
-    max_cy = slide_height - margin
+    margin = size * parent_ds / 2
+    margin_int = int(margin)
+    max_cx = slide_width - margin_int
+    max_cy = slide_height - margin_int
+
+    sampler: Optional[PolygonSampler] = None
+    if polygons:
+        sampler = PolygonSampler(polygons, margin, slide_width, slide_height)
+        if not sampler.is_available():
+            print(
+                "Warning: annotation polygons for "
+                f"{slide_path.name} are too small for sampling."
+            )
+            sampler = None
 
     bags = []
+    patch_rows: List[Dict[str, str]] = []
+    patient_id = _generate_patient_id(slide_path)
     i = 0
     attempts = 0
     max_attempts = num_parents * 20 if num_parents > 0 else 0
     while i < num_parents and (max_attempts == 0 or attempts < max_attempts):
         attempts += 1
-        center_x = random.randint(margin, max_cx)
-        center_y = random.randint(margin, max_cy)
+        if sampler is not None:
+            candidate = sampler.sample()
+            if candidate is None:
+                print(
+                    "Warning: unable to find more valid centers inside "
+                    f"annotations for {slide_path.name}."
+                )
+                break
+            center_x, center_y, selected_region = candidate
+        else:
+            center_x = random.randint(margin_int, max_cx)
+            center_y = random.randint(margin_int, max_cy)
+            selected_region = None
         prefix = f"patch_{i}"
         bag = generate_hierarchy(
             slide,
@@ -199,7 +623,43 @@ def process_wsi(
             background_threshold,
         )
         if bag:
-            bags.append(bag)
+            bag_node, tiles = bag
+            bags.append(bag_node)
+            if selected_region and selected_region.value:
+                region_value = selected_region.value.strip() or "Normal"
+            else:
+                region_value = "Normal"
+            label_str = ""
+            if label_encoder is not None:
+                try:
+                    label_id, canonical_value = label_encoder.encode(region_value)
+                except (KeyError, ValueError) as exc:
+                    print(
+                        "Warning:",
+                        exc,
+                        "-- leaving label empty for",
+                        slide_path.name,
+                        f"(bag {i}).",
+                    )
+                else:
+                    label_str = str(label_id)
+                    region_value = canonical_value
+            for tile in tiles:
+                patch_rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "pathology_id": slide_path.name,
+                        "subtype": region_value,
+                        "labels": label_str,
+                        "resolved_path": str(slide_path),
+                        "slide_stem": slide_path.stem,
+                        "bag_index": str(i),
+                        "patch_id": tile.patch_id,
+                        "patch_file": tile.patch_file,
+                        "patch_path": str(tile.patch_path),
+                        "patch_scale": tile.scale_suffix,
+                    }
+                )
             i += 1
 
     if i < num_parents:
@@ -213,7 +673,7 @@ def process_wsi(
 
     slide.close()
 
-    return len(bags)
+    return len(bags), patch_rows
 
 
 def gather_slides(wsi_root: Path) -> List[Path]:
@@ -415,6 +875,14 @@ def main() -> None:
         help="Column in the metadata CSV that stores slide file names",
     )
     parser.add_argument(
+        "--annotation-dir",
+        type=Path,
+        help=(
+            "Directory or file containing Aperio-style XML annotations. "
+            "If provided, patches are sampled only from annotated regions."
+        ),
+    )
+    parser.add_argument(
         "--num-wsi",
         type=int,
         default=50,
@@ -428,6 +896,10 @@ def main() -> None:
         raise FileNotFoundError(f"No WSI files found at {args.wsi_dir}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    annotation_root = resolve_annotation_root(args.annotation_dir)
+    annotation_lookup = index_annotation_files(annotation_root)
+    label_encoder = ValueLabelEncoder()
+    all_patch_rows: List[Dict[str, str]] = []
 
     if args.metadata_csv is not None:
         metadata_rows, fieldnames = load_metadata_table(args.metadata_csv)
@@ -448,15 +920,22 @@ def main() -> None:
             slide_path, row = pair
             subtype = row[args.metadata_subtype_column]
             print(f"Processing {slide_path}")
-            bags_collected = process_wsi(
+            annotation_polygons = load_slide_polygons(
+                slide_path,
+                annotation_root,
+                annotation_lookup,
+            )
+            bag_count, patch_rows = process_wsi(
                 slide_path,
                 args.out_dir,
                 num_parents=args.num_parents,
                 seed=args.seed,
                 tissue_threshold=args.tissue_threshold,
                 background_threshold=args.background_threshold,
+                polygons=annotation_polygons,
+                label_encoder=label_encoder,
             )
-            if bags_collected < args.num_parents:
+            if bag_count < args.num_parents:
                 slide_out_dir = args.out_dir / slide_path.stem
                 if slide_out_dir.exists():
                     shutil.rmtree(slide_out_dir, ignore_errors=True)
@@ -464,12 +943,13 @@ def main() -> None:
                 print(
                     f"Scheduling an additional slide for subtype '{subtype}' "
                     f"because {slide_path.name} ({reason}) yielded "
-                    f"{bags_collected} patch bags."
+                    f"{bag_count} patch bags."
                 )
                 return False
 
             counts[subtype] += 1
             accepted_pairs.append(pair)
+            all_patch_rows.extend(patch_rows)
             return True
 
         for pair in selection.initial:
@@ -520,14 +1000,44 @@ def main() -> None:
     else:
         for slide_path in slides:
             print(f"Processing {slide_path}")
-            process_wsi(
+            annotation_polygons = load_slide_polygons(
+                slide_path,
+                annotation_root,
+                annotation_lookup,
+            )
+            bag_count, patch_rows = process_wsi(
                 slide_path,
                 args.out_dir,
                 num_parents=args.num_parents,
                 seed=args.seed,
                 tissue_threshold=args.tissue_threshold,
                 background_threshold=args.background_threshold,
+                polygons=annotation_polygons,
+                label_encoder=label_encoder,
             )
+            if bag_count >= args.num_parents or args.num_parents == 0:
+                all_patch_rows.extend(patch_rows)
+
+    if all_patch_rows:
+        patch_csv_path = args.out_dir / "patches.csv"
+        fieldnames = [
+            "patient_id",
+            "pathology_id",
+            "subtype",
+            "labels",
+            "resolved_path",
+            "slide_stem",
+            "bag_index",
+            "patch_id",
+            "patch_file",
+            "patch_path",
+            "patch_scale",
+        ]
+        with patch_csv_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in all_patch_rows:
+                writer.writerow(row)
 
 
 if __name__ == "__main__":
