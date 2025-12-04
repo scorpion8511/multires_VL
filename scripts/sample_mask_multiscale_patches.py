@@ -26,6 +26,9 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image
 
+# Disable PIL's decompression bomb check for very large whole-slide images.
+Image.MAX_IMAGE_PIXELS = None
+
 from sample_tcga_multiscale_patches import PatchTile, ValueLabelEncoder, compute_tissue_fraction
 
 
@@ -75,7 +78,10 @@ def _compute_max_margin(patch_size: int, scales: Sequence[float]) -> int:
 def _sample_centers(mask: np.ndarray, count: int, margin: int, positive: bool) -> List[Tuple[int, int]]:
     if count <= 0:
         return []
-    coords = np.argwhere(mask > 0) if positive else np.argwhere(mask == 0)
+    mask_binary = mask
+    if mask.ndim == 3:
+        mask_binary = mask.any(axis=-1)
+    coords = np.argwhere(mask_binary > 0) if positive else np.argwhere(mask_binary == 0)
     if len(coords) == 0:
         return []
     height, width = mask.shape[:2]
