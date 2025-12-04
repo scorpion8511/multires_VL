@@ -148,11 +148,13 @@ def generate_hierarchy_from_image(
     base_scale = float(scales[0])
     parent: Optional[Dict[str, object]] = None
 
+    mag_map = {2.0: "5x", 1.0: "10x", 0.5: "20x", 0.25: "40x"}
+
     for scale in scales:
         if scale <= 0:
             raise ValueError("Scale values must be positive")
         window_factor = scale / base_scale
-        suffix = f"{scale:.2f}mpp"
+        suffix = mag_map.get(scale, f"{scale:.2f}mpp")
         patch_id = f"{prefix}_{suffix}"
         out_path = out_dir / f"{patch_id}.png"
 
@@ -195,6 +197,7 @@ def generate_hierarchy_from_image(
 def _record_patch_rows(
     rows: List[Dict[str, str]],
     tiles: Iterable[PatchTile],
+    patient_id: str,
     image_path: Path,
     bag_index: int,
     label_name: str,
@@ -203,8 +206,12 @@ def _record_patch_rows(
     for tile in tiles:
         rows.append(
             {
-                "image_file": image_path.name,
-                "image_stem": image_path.stem,
+                "patient_id": patient_id,
+                "pathology_id": image_path.name,
+                "subtype": label_name,
+                "labels": str(label_id),
+                "resolved_path": str(image_path),
+                "slide_stem": image_path.stem,
                 "bag_index": str(bag_index),
                 "bag_label": label_name,
                 "bag_label_id": str(label_id),
@@ -214,6 +221,13 @@ def _record_patch_rows(
                 "patch_scale": tile.scale_suffix,
             }
         )
+
+
+def _generate_patient_id(image_path: Path) -> str:
+    """Return a deterministic pseudo-random identifier for ``image_path``."""
+
+    seed = abs(hash(image_path.stem.lower())) % 10**12
+    return f"{seed:012d}"
 
 
 def sample_image(
@@ -246,6 +260,7 @@ def sample_image(
 
     bags: List[Dict[str, object]] = []
     patch_rows: List[Dict[str, str]] = []
+    patient_id = _generate_patient_id(image_path)
     label_pos_id, label_pos_name = label_encoder.encode("Positive")
     label_neg_id, label_neg_name = label_encoder.encode("Negative")
 
@@ -267,7 +282,15 @@ def sample_image(
             continue
         bag.node.update({"label": label_pos_name, "label_id": label_pos_id, "center": [center_x, center_y]})
         bags.append(bag.node)
-        _record_patch_rows(patch_rows, bag.tiles, image_path, bag_index, label_pos_name, label_pos_id)
+        _record_patch_rows(
+            patch_rows,
+            bag.tiles,
+            patient_id,
+            image_path,
+            bag_index,
+            label_pos_name,
+            label_pos_id,
+        )
         bag_index += 1
 
     for center_x, center_y in negative_centers:
@@ -287,7 +310,15 @@ def sample_image(
             continue
         bag.node.update({"label": label_neg_name, "label_id": label_neg_id, "center": [center_x, center_y]})
         bags.append(bag.node)
-        _record_patch_rows(patch_rows, bag.tiles, image_path, bag_index, label_neg_name, label_neg_id)
+        _record_patch_rows(
+            patch_rows,
+            bag.tiles,
+            patient_id,
+            image_path,
+            bag_index,
+            label_neg_name,
+            label_neg_id,
+        )
         bag_index += 1
 
     bags_path = out_dir / "bags.json"
@@ -308,9 +339,16 @@ def _gather_images(image_root: Path, image_exts: Sequence[str]) -> List[Path]:
 
 
 def _write_manifest(path: Path, rows: Iterable[Dict[str, str]]) -> None:
+    rows = list(rows)
+    if not rows:
+        return
     fieldnames = [
-        "image_file",
-        "image_stem",
+        "patient_id",
+        "pathology_id",
+        "subtype",
+        "labels",
+        "resolved_path",
+        "slide_stem",
         "bag_index",
         "bag_label",
         "bag_label_id",
