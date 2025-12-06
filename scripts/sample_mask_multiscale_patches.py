@@ -5,8 +5,9 @@ This script mirrors the multi-scale patch generation pipeline used for
 whole-slide images but operates on conventional paired images and masks. It
 supports datasets where images and masks share a filename stem (for example,
 ``foo.jpg`` alongside ``foo.png``) and works with multiple file formats,
-including TIFF. Positive patch centers are sampled from non-zero mask pixels,
-while negative centers come from background regions.
+including TIFF. Positive patch centers are sampled from colored mask pixels
+(per-class if a color map is available), while negative centers come from
+background regions.
 
 The resulting hierarchy for each sampled bag is saved beneath an image-specific
 output directory alongside a ``bags.json`` description and an aggregated
@@ -44,6 +45,27 @@ SUPPORTED_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")
 SUPPORTED_MASK_EXTS = (".png", ".tif", ".tiff")
 
 
+CLASS_INFO = [
+    {"id": 0, "name": "Background", "abbr": "BKG", "color": (0, 0, 0)},
+    {"id": 1, "name": "Keratin", "abbr": "KER", "color": (224, 224, 224)},
+    {"id": 2, "name": "Epidermis", "abbr": "EPI", "color": (112, 48, 160)},
+    {"id": 3, "name": "Papillary dermis", "abbr": "PAP", "color": (0, 176, 240)},
+    {"id": 4, "name": "Reticular dermis", "abbr": "RET", "color": (127, 0, 255)},
+    {"id": 5, "name": "Hypodermis", "abbr": "HYP", "color": (192, 0, 0)},
+    {"id": 6, "name": "Glands", "abbr": "GLD", "color": (127, 96, 255)},
+    {"id": 7, "name": "Follicles", "abbr": "FOL", "color": (96, 96, 96)},
+    {"id": 8, "name": "Inflammation", "abbr": "INF", "color": (255, 56, 0)},
+    {"id": 9, "name": "Basal Cell Carcinoma", "abbr": "BCC", "color": (127, 255, 0)},
+    {"id": 10, "name": "Squamous Cell Carcinoma", "abbr": "SCC", "color": (255, 255, 0)},
+    {
+        "id": 11,
+        "name": "Intraepidermal Carcinoma",
+        "abbr": "IEC",
+        "color": (150, 150, 0),
+    },
+]
+
+
 def _ensure_output_dir(out_root: Path, image_path: Path) -> Path:
     out_dir = out_root / image_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -64,7 +86,7 @@ def _load_image(path: Path) -> Image.Image:
 
 def _load_mask(path: Path) -> np.ndarray:
     mask = Image.open(path)
-    return np.array(mask)
+    return np.array(mask.convert("RGB"))
 
 
 def _compute_max_margin(patch_size: int, scales: Sequence[float]) -> int:
@@ -75,16 +97,25 @@ def _compute_max_margin(patch_size: int, scales: Sequence[float]) -> int:
     return max(1, margin)
 
 
-def _sample_centers(mask: np.ndarray, count: int, margin: int, positive: bool) -> List[Tuple[int, int]]:
+def _build_label_map(mask_rgb: np.ndarray) -> np.ndarray:
+    mask_rgb = mask_rgb[..., :3]
+    if mask_rgb.ndim == 2:
+        mask_rgb = np.repeat(mask_rgb[..., None], 3, axis=-1)
+    label_map = np.full(mask_rgb.shape[:2], -1, dtype=np.int16)
+    for class_info in CLASS_INFO:
+        color = np.asarray(class_info["color"], dtype=mask_rgb.dtype)
+        matches = np.all(mask_rgb == color, axis=-1)
+        label_map[matches] = class_info["id"]
+    return label_map
+
+
+def _sample_centers(label_map: np.ndarray, count: int, margin: int, class_id: int) -> List[Tuple[int, int]]:
     if count <= 0:
         return []
-    mask_binary = mask
-    if mask.ndim == 3:
-        mask_binary = mask.any(axis=-1)
-    coords = np.argwhere(mask_binary > 0) if positive else np.argwhere(mask_binary == 0)
+    coords = np.argwhere(label_map == class_id)
     if len(coords) == 0:
         return []
-    height, width = mask.shape[:2]
+    height, width = label_map.shape
     valid = [
         (int(x), int(y))
         for y, x in coords
@@ -246,80 +277,89 @@ def sample_image(
     random.seed(seed)
 
     image = _load_image(image_path)
-    mask = _load_mask(mask_path)
-    if mask.shape[:2] != (image.height, image.width):
+    mask_rgb = _load_mask(mask_path)
+    if mask_rgb.shape[:2] != (image.height, image.width):
         raise ValueError(
             f"Mask {mask_path} does not match image dimensions for {image_path.name}: "
-            f"expected {(image.height, image.width)}, got {mask.shape[:2]}"
+            f"expected {(image.height, image.width)}, got {mask_rgb.shape[:2]}"
         )
+    label_map = _build_label_map(mask_rgb)
 
     out_dir = _ensure_output_dir(out_root, image_path)
     margin = _compute_max_margin(patch_size, scales)
-    positive_centers = _sample_centers(mask, positive_bags, margin, positive=True)
-    negative_centers = _sample_centers(mask, negative_bags, margin, positive=False)
 
     bags: List[Dict[str, object]] = []
     patch_rows: List[Dict[str, str]] = []
     patient_id = _generate_patient_id(image_path)
-    label_pos_id, label_pos_name = label_encoder.encode("Positive")
-    label_neg_id, label_neg_name = label_encoder.encode("Negative")
+    class_lookup = {info["id"]: info for info in CLASS_INFO}
+    background_id = CLASS_INFO[0]["id"]
 
     bag_index = 0
-    for center_x, center_y in positive_centers:
-        prefix = f"patch_{bag_index}"
-        bag = generate_hierarchy_from_image(
-            image,
-            center_x,
-            center_y,
-            list(scales),
-            prefix,
-            out_dir,
-            patch_size,
-            tissue_threshold,
-            background_threshold,
-        )
-        if not bag:
+    for class_info in CLASS_INFO:
+        if class_info["id"] == background_id:
             continue
-        bag.node.update({"label": label_pos_name, "label_id": label_pos_id, "center": [center_x, center_y]})
-        bags.append(bag.node)
-        _record_patch_rows(
-            patch_rows,
-            bag.tiles,
-            patient_id,
-            image_path,
-            bag_index,
-            label_pos_name,
-            label_pos_id,
-        )
-        bag_index += 1
+        centers = _sample_centers(label_map, positive_bags, margin, class_info["id"])
+        if not centers:
+            continue
+        label_id, label_name = label_encoder.encode(class_info["name"])
+        for center_x, center_y in centers:
+            prefix = f"patch_{bag_index}"
+            bag = generate_hierarchy_from_image(
+                image,
+                center_x,
+                center_y,
+                list(scales),
+                prefix,
+                out_dir,
+                patch_size,
+                tissue_threshold,
+                background_threshold,
+            )
+            if not bag:
+                continue
+            bag.node.update({"label": label_name, "label_id": label_id, "center": [center_x, center_y]})
+            bags.append(bag.node)
+            _record_patch_rows(
+                patch_rows,
+                bag.tiles,
+                patient_id,
+                image_path,
+                bag_index,
+                label_name,
+                label_id,
+            )
+            bag_index += 1
 
-    for center_x, center_y in negative_centers:
-        prefix = f"patch_{bag_index}"
-        bag = generate_hierarchy_from_image(
-            image,
-            center_x,
-            center_y,
-            list(scales),
-            prefix,
-            out_dir,
-            patch_size,
-            tissue_threshold,
-            background_threshold,
-        )
-        if not bag:
-            continue
-        bag.node.update({"label": label_neg_name, "label_id": label_neg_id, "center": [center_x, center_y]})
-        bags.append(bag.node)
-        _record_patch_rows(
-            patch_rows,
-            bag.tiles,
-            patient_id,
-            image_path,
-            bag_index,
-            label_neg_name,
-            label_neg_id,
-        )
-        bag_index += 1
+    centers_background = _sample_centers(label_map, negative_bags, margin, background_id)
+    if centers_background:
+        label_id, label_name = label_encoder.encode(class_lookup[background_id]["name"])
+        for center_x, center_y in centers_background:
+            prefix = f"patch_{bag_index}"
+            bag = generate_hierarchy_from_image(
+                image,
+                center_x,
+                center_y,
+                list(scales),
+                prefix,
+                out_dir,
+                patch_size,
+                tissue_threshold,
+                background_threshold,
+            )
+            if not bag:
+                continue
+            bag.node.update({"label": label_name, "label_id": label_id, "center": [center_x, center_y]})
+            bags.append(bag.node)
+            _record_patch_rows(
+                patch_rows,
+                bag.tiles,
+                patient_id,
+                image_path,
+                bag_index,
+                label_name,
+                label_id,
+            )
+            bag_index += 1
 
     bags_path = out_dir / "bags.json"
     with bags_path.open("w", encoding="utf-8") as f:
@@ -373,8 +413,15 @@ def parse_args() -> argparse.Namespace:
         help="Root directory containing masks that share the same filename stem as images",
     )
     parser.add_argument("output_dir", type=Path, help="Directory where patches and manifests are written")
-    parser.add_argument("--positive-bags", type=int, default=5, help="Number of positive bags to sample per image")
-    parser.add_argument("--negative-bags", type=int, default=5, help="Number of negative bags to sample per image")
+    parser.add_argument(
+        "--positive-bags",
+        type=int,
+        default=5,
+        help="Number of bags to sample per annotated class (excluding background)",
+    )
+    parser.add_argument(
+        "--negative-bags", type=int, default=5, help="Number of background bags to sample per image"
+    )
     parser.add_argument(
         "--magnifications",
         type=float,
@@ -419,7 +466,7 @@ def main() -> None:
         raise SystemExit(f"No images found under {args.image_dir} with extensions {args.image_exts}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    label_encoder = ValueLabelEncoder({"positive": (1, "Positive"), "negative": (0, "Negative")})
+    label_encoder = ValueLabelEncoder({info["name"].lower(): (info["id"], info["name"]) for info in CLASS_INFO})
 
     all_rows: List[Dict[str, str]] = []
     for index, image_path in enumerate(images):
