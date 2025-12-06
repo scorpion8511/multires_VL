@@ -420,6 +420,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _build_label_encoder(labels: Iterable[str]) -> ValueLabelEncoder:
+    """Create a label encoder that includes all diagnoses plus background."""
+
+    unique_labels = sorted({label.strip() for label in labels if label.strip()})
+    mapping: Dict[str, Tuple[int, str]] = {"background": (0, "Background")}
+
+    for idx, label in enumerate(unique_labels, start=1):
+        mapping[label] = (idx, label)
+
+    return ValueLabelEncoder(mapping)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -429,7 +441,7 @@ def main() -> None:
         raise SystemExit(f"No images found under {args.image_dir} with extensions {args.image_exts}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    label_encoder = ValueLabelEncoder({"background": (0, "Background")})
+    label_encoder = _build_label_encoder(label_lookup.values())
 
     all_rows: List[Dict[str, str]] = []
     for index, image_path in enumerate(images):
