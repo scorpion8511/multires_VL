@@ -61,12 +61,36 @@ def _load_image(path: Path) -> Image.Image:
     return Image.open(path).convert("RGB")
 
 
-def _build_label_map(image: Image.Image, class_id: int, background_threshold: int) -> np.ndarray:
+def _build_label_map(
+    image: Image.Image, class_id: int, background_threshold: int, max_side: int = 4096
+) -> Tuple[np.ndarray, Tuple[float, float]]:
+    """Create a (possibly downscaled) label map and scale factors.
+
+    Whole-slide PNGs can be extremely large and exhaust memory when converted to
+    a full-resolution numpy array. To keep sampling lightweight, we optionally
+    downscale the label map to ``max_side`` on the longest dimension and return
+    per-axis scale factors for mapping centers back to the original resolution.
+    """
+
     gray = np.array(image.convert("L"))
     tissue_mask = gray < background_threshold
     label_map = np.zeros_like(gray, dtype=np.int16)
     label_map[tissue_mask] = class_id
-    return label_map
+
+    orig_h, orig_w = label_map.shape
+    longest = max(orig_h, orig_w)
+
+    if longest > max_side:
+        scale = longest / float(max_side)
+        new_w = max(1, int(round(orig_w / scale)))
+        new_h = max(1, int(round(orig_h / scale)))
+        label_map = np.array(Image.fromarray(label_map).resize((new_w, new_h), Image.NEAREST))
+    else:
+        scale = 1.0
+
+    scale_w = orig_w / float(label_map.shape[1])
+    scale_h = orig_h / float(label_map.shape[0])
+    return label_map, (scale_w, scale_h)
 
 
 def _compute_max_margin(patch_size: int, scales: Sequence[float]) -> int:
@@ -77,22 +101,42 @@ def _compute_max_margin(patch_size: int, scales: Sequence[float]) -> int:
     return max(1, margin)
 
 
-def _sample_centers(label_map: np.ndarray, count: int, margin: int, class_id: int) -> List[Tuple[int, int]]:
+def _sample_centers(
+    label_map: np.ndarray,
+    count: int,
+    margin: int,
+    class_id: int,
+    scale_factors: Tuple[float, float],
+    image_size: Tuple[int, int],
+) -> List[Tuple[int, int]]:
     if count <= 0:
         return []
     coords = np.argwhere(label_map == class_id)
     if len(coords) == 0:
         return []
     height, width = label_map.shape
+    scale_w, scale_h = scale_factors
+    margin_x = max(1, int(np.ceil(margin / scale_w)))
+    margin_y = max(1, int(np.ceil(margin / scale_h)))
+    img_w, img_h = image_size
     valid = [
-        (int(x), int(y))
+        (
+            int(round((x + 0.5) * scale_w)),
+            int(round((y + 0.5) * scale_h)),
+        )
         for y, x in coords
-        if margin <= x < width - margin and margin <= y < height - margin
+        if margin_x <= x < width - margin_x and margin_y <= y < height - margin_y
     ]
     if not valid:
         return []
     random.shuffle(valid)
-    return valid[:count]
+    trimmed: List[Tuple[int, int]] = []
+    for cx, cy in valid:
+        if margin <= cx < img_w - margin and margin <= cy < img_h - margin:
+            trimmed.append((cx, cy))
+        if len(trimmed) >= count:
+            break
+    return trimmed
 
 
 def _extract_patch(
@@ -265,7 +309,7 @@ def sample_image(
 
     image = _load_image(image_path)
     label_id, label_name = label_encoder.encode(diagnosis)
-    label_map = _build_label_map(image, label_id, background_threshold)
+    label_map, scale_factors = _build_label_map(image, label_id, background_threshold)
 
     out_dir = _ensure_output_dir(out_root, image_path)
     margin = _compute_max_margin(patch_size, scales)
@@ -275,7 +319,7 @@ def sample_image(
     patient_id = _generate_patient_id(image_path)
 
     bag_index = 0
-    centers = _sample_centers(label_map, positive_bags, margin, label_id)
+    centers = _sample_centers(label_map, positive_bags, margin, label_id, scale_factors, image.size)
     for center_x, center_y in centers:
         prefix = f"patch_{bag_index}"
         bag = generate_hierarchy_from_image(
@@ -307,7 +351,9 @@ def sample_image(
     background_id, background_name = label_encoder.encode("Background")
     if negative_bags > 0:
         bg_map = np.zeros_like(label_map)
-        centers_background = _sample_centers(bg_map, negative_bags, margin, background_id)
+        centers_background = _sample_centers(
+            bg_map, negative_bags, margin, background_id, scale_factors, image.size
+        )
         if centers_background:
             bg_label_id, bg_label_name = background_id, background_name
             for center_x, center_y in centers_background:
