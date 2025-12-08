@@ -41,6 +41,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+try:  # Optional smoothing for clearer separation
+    from scipy.stats import gaussian_kde
+except Exception:  # pragma: no cover - optional dependency
+    gaussian_kde = None
+
 
 SUPPORTED_EXTS = {".csv", ".tsv", ".jsonl", ".json"}
 
@@ -140,6 +145,7 @@ def plot_energy(
     output: Path,
     bins: int = 40,
     alpha: float = 0.6,
+    kde: bool = True,
 ) -> None:
     if df.empty:
         raise ValueError("No data to plot after filtering.")
@@ -154,17 +160,39 @@ def plot_energy(
         ax = axes[idx // ncols][idx % ncols]
         subset = df[df["dataset"] == dataset]
         models = list(pd.unique(subset["model"]))
+
+        all_scores = subset["energy"].astype(float)
+        if all_scores.empty:
+            continue
+        xmin, xmax = all_scores.min(), all_scores.max()
+        margin = 0.05 * (xmax - xmin if xmax > xmin else 1.0)
+        bin_edges = np.linspace(xmin - margin, xmax + margin, bins + 1)
+
         for model in models:
             scores = subset[subset["model"] == model]["energy"].astype(float)
             label_row = subset[subset["model"] == model].iloc[0].to_dict()
+
+            color = ax._get_lines.get_next_color()
             ax.hist(
                 scores,
-                bins=bins,
+                bins=bin_edges,
                 density=True,
                 alpha=alpha,
                 label=_format_label(label_row),
-                edgecolor="none",
+                edgecolor="white",
+                linewidth=0.6,
+                histtype="stepfilled",
+                color=color,
             )
+
+            mean = float(scores.mean()) if len(scores) else 0.0
+            ax.axvline(mean, color=color, linestyle="--", linewidth=1.0, alpha=0.9)
+
+            if kde and gaussian_kde is not None and len(scores) > 1:
+                kde_fn = gaussian_kde(scores)
+                x_grid = np.linspace(bin_edges[0], bin_edges[-1], 400)
+                ax.plot(x_grid, kde_fn(x_grid), color=color, linewidth=1.6)
+
         ax.set_title(dataset)
         ax.set_xlabel("Energy Score")
         ax.set_ylabel("Frequency")
@@ -213,6 +241,12 @@ def parse_args() -> argparse.Namespace:
         help="Histogram alpha/opacity (default: 0.6).",
     )
     parser.add_argument(
+        "--no-kde",
+        dest="kde",
+        action="store_false",
+        help="Disable KDE overlay lines (enabled by default).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("gabor_energy.png"),
@@ -225,7 +259,7 @@ def main() -> None:
     args = parse_args()
     df = load_energy_tables(args.input)
     df = filter_and_order(df, args.datasets, args.models)
-    plot_energy(df, args.output, bins=args.bins, alpha=args.alpha)
+    plot_energy(df, args.output, bins=args.bins, alpha=args.alpha, kde=args.kde)
 
 
 if __name__ == "__main__":
