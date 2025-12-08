@@ -64,29 +64,31 @@ def _load_image(path: Path) -> Image.Image:
 def _build_label_map(
     image: Image.Image, class_id: int, background_threshold: int, max_side: int = 4096
 ) -> Tuple[np.ndarray, Tuple[float, float]]:
-    """Create a (possibly downscaled) label map and scale factors.
+    """Create a memory-efficient label map and scale factors.
 
-    Whole-slide PNGs can be extremely large and exhaust memory when converted to
-    a full-resolution numpy array. To keep sampling lightweight, we optionally
-    downscale the label map to ``max_side`` on the longest dimension and return
-    per-axis scale factors for mapping centers back to the original resolution.
+    Instead of converting the full-resolution slide into a numpy array (which
+    can exhaust memory for very large PNGs), we optionally downscale the image
+    *before* converting to numpy. The resulting label map is small while the
+    returned scale factors preserve the mapping back to the original
+    resolution.
     """
 
-    gray = np.array(image.convert("L"))
-    tissue_mask = gray < background_threshold
-    label_map = np.zeros_like(gray, dtype=np.int16)
-    label_map[tissue_mask] = class_id
-
-    orig_h, orig_w = label_map.shape
-    longest = max(orig_h, orig_w)
+    orig_w, orig_h = image.size
+    longest = max(orig_w, orig_h)
 
     if longest > max_side:
         scale = longest / float(max_side)
         new_w = max(1, int(round(orig_w / scale)))
         new_h = max(1, int(round(orig_h / scale)))
-        label_map = np.array(Image.fromarray(label_map).resize((new_w, new_h), Image.NEAREST))
+        resized = image.convert("L").resize((new_w, new_h), Image.BILINEAR)
     else:
         scale = 1.0
+        resized = image.convert("L")
+
+    gray = np.array(resized)
+    tissue_mask = gray < background_threshold
+    label_map = np.zeros_like(gray, dtype=np.int16)
+    label_map[tissue_mask] = class_id
 
     scale_w = orig_w / float(label_map.shape[1])
     scale_h = orig_h / float(label_map.shape[0])
