@@ -50,6 +50,24 @@ def _ensure_output_dir(out_root: Path, image_path: Path) -> Path:
     return out_dir
 
 
+def _has_existing_patches(out_root: Path, image_path: Path) -> bool:
+    """Return True if patches for this image already exist.
+
+    We look for previously saved patch PNGs or a ``bags.json`` file in the
+    slide-specific output directory. When present, the slide is skipped to
+    avoid recomputing patches.
+    """
+
+    out_dir = out_root / image_path.stem
+    if not out_dir.exists():
+        return False
+
+    if (out_dir / "bags.json").exists():
+        return True
+
+    return any(out_dir.glob("*.png"))
+
+
 def _gather_images(image_root: Path, image_exts: Sequence[str]) -> List[Path]:
     return [
         path
@@ -323,6 +341,10 @@ def sample_image(
             break
     if annotation_path is None:
         raise ValueError(f"No annotation JSON found for {image_path.name} under {annotation_dir}")
+
+    if _has_existing_patches(out_root, image_path):
+        print(f"Skipping {image_path.name}: patches already exist under {out_root / image_path.stem}")
+        return [], []
 
     image = _load_image(image_path)
     label_map = _load_label_map(annotation_path, (image.width, image.height))
