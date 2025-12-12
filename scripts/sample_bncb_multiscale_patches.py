@@ -51,12 +51,7 @@ def _ensure_output_dir(out_root: Path, image_path: Path) -> Path:
 
 
 def _has_existing_patches(out_root: Path, image_path: Path) -> bool:
-    """Return True if patches for this image already exist.
-
-    We look for previously saved patch PNGs or a ``bags.json`` file in the
-    slide-specific output directory. When present, the slide is skipped to
-    avoid recomputing patches.
-    """
+    """Return True if patches for this image already exist."""
 
     out_dir = out_root / image_path.stem
     if not out_dir.exists():
@@ -66,6 +61,77 @@ def _has_existing_patches(out_root: Path, image_path: Path) -> bool:
         return True
 
     return any(out_dir.glob("*.png"))
+
+
+def _parse_bag_index(patch_id: str) -> Optional[int]:
+    parts = patch_id.split("_")
+    if len(parts) < 3 or parts[0] != "patch":
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _collect_nodes(node: Dict[str, object]) -> List[Dict[str, object]]:
+    nodes = [node]
+    for child in node.get("children", []) or []:
+        if isinstance(child, dict):
+            nodes.extend(_collect_nodes(child))
+    return nodes
+
+
+def _load_existing_patch_rows(
+    image_path: Path, out_root: Path, label_encoder: ValueLabelEncoder
+) -> List[Dict[str, str]]:
+    """Reconstruct manifest rows from a prior run if patches already exist."""
+
+    out_dir = out_root / image_path.stem
+    bags_path = out_dir / "bags.json"
+    if not bags_path.exists():
+        return []
+
+    patient_id = _generate_patient_id(image_path)
+    with bags_path.open("r", encoding="utf-8") as f:
+        bags = json.load(f)
+
+    rows: List[Dict[str, str]] = []
+    for bag in bags if isinstance(bags, list) else []:
+        if not isinstance(bag, dict):
+            continue
+        label_name = bag.get("label", "Unknown")
+        label_id = bag.get("label_id")
+        if label_id is None:
+            try:
+                label_id, _ = label_encoder.encode(label_name)
+            except KeyError:
+                label_id = CLASS_INFO[0]["id"]
+        bag_nodes = _collect_nodes(bag)
+        bag_index = None
+        for node in bag_nodes:
+            patch_id = str(node.get("id", ""))
+            bag_index = bag_index or _parse_bag_index(patch_id)
+            patch_file = str(node.get("file", ""))
+            if not patch_file:
+                continue
+            patch_scale = patch_id.split("_")[-1] if "_" in patch_id else ""
+            patch_rows = {
+                "patient_id": patient_id,
+                "pathology_id": image_path.name,
+                "subtype": label_name,
+                "labels": str(label_id),
+                "resolved_path": str(image_path),
+                "slide_stem": image_path.stem,
+                "bag_index": str(bag_index or 0),
+                "bag_label": label_name,
+                "bag_label_id": str(label_id),
+                "patch_id": patch_id,
+                "patch_file": patch_file,
+                "patch_path": str(out_dir / patch_file),
+                "patch_scale": patch_scale,
+            }
+            rows.append(patch_rows)
+    return rows
 
 
 def _gather_images(image_root: Path, image_exts: Sequence[str]) -> List[Path]:
@@ -344,7 +410,8 @@ def sample_image(
 
     if _has_existing_patches(out_root, image_path):
         print(f"Skipping {image_path.name}: patches already exist under {out_root / image_path.stem}")
-        return [], []
+        existing_rows = _load_existing_patch_rows(image_path, out_root, label_encoder)
+        return [], existing_rows
 
     image = _load_image(image_path)
     label_map = _load_label_map(annotation_path, (image.width, image.height))
